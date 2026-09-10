@@ -1,0 +1,36 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: cleaning-postgres
+    restart: unless-stopped
+    ports:
+      # Host port -> container 5432. The right number is fixed: Postgres
+      # always serves 5432 inside the container, and nothing in there knows
+      # or cares what it is published as. The left comes from .env, defaulted
+      # to 5433 rather than 5432 because a native PostgreSQL 17 service is
+      # already holding 5432 on the development machine -- two servers cannot
+      # share a port, and stopping someone's other database is not a setup
+      # that reproduces. Every client reads POSTGRES_PORT from the same file,
+      # so the mapping and the connection string cannot drift apart.
+      - "${POSTGRES_PORT:-5433}:5432"
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-pipeline}
+      # Defaulted so `docker compose up` works with no .env, but read from the
+      # environment first, which is where a real credential would come from.
+      # Nothing outside this machine can reach the port, so a weak local
+      # default is a convenience rather than an exposure.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-pipeline}
+      POSTGRES_DB: ${POSTGRES_DB:-transactions}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # Makes `docker compose ps` report "healthy" rather than merely
+      # "running" -- Postgres accepts a TCP connection several seconds before
+      # it will accept a query, and that gap is a confusing first failure.
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-pipeline} -d ${POSTGRES_DB:-transactions}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  pgdata:
