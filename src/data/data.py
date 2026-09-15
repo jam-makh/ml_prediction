@@ -1,0 +1,536 @@
+"""Loading the monthly feature table and handing it on as a typed dataset.
+
+This is the first link in the chain: everything downstream (preprocessing,
+splitting, training, evaluation) receives a ``Dataset`` from here rather than a
+bare DataFrame, so the four column roles -- entity, time, features, target --
+are named once and never re-guessed further down.
+
+Three things are enforced here rather than left to the caller:
+
+* Types. Postgres ``numeric`` arrives through psycopg2 as ``Decimal`` objects
+  in an ``object`` column. They compare and print like numbers, so the problem
+  does not surface until an estimator raises several steps later.
+* Ordering. Rows are sorted by entity then time. A per-user series that is not
+  in time order makes any lag-shaped check downstream meaningless.
+* Shape. One row per (user, month) pair, no duplicates, target present. A
+  duplicated pair would put the same month on both sides of a time split.
+
+The feature list is derived by exclusion: everything that is not the target,
+the entity id or the time column. Adding a column to the feature table
+therefore adds it to the model without a code change, which is the behaviour
+we want while the table is still being iterated on.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+import numpy as np
+import numpy.typing as npt
+import pandas as pd
+from pydantic import BaseModel, ConfigDict
+from sqlalchemy.engine import Engine
+
+from src.config.config import load_config
+from src.data.db_link import load_dataframe
+
+# Pandas period alias for a calendar month. Month values are normalised through
+# it to the first of the month: the feature table already stores them that way,
+# but normalising means a timestamp arriving with a time component cannot open a
+# second, near-duplicate month.
+MONTH_PERIOD = "M"
+
+
+class Dataset(BaseModel):
+    """A feature table with its four column roles named.
+
+    Wraps a single DataFrame and records which column is the target, which
+    identifies the entity (a user), which carries time, and which of the rest
+    are model features. Frozen because a split or a subset should produce a new
+    ``Dataset`` rather than quietly mutating the one every other part of the
+    run is holding.
+
+    Pydantic guards the container only: it checks that ``frame`` is a DataFrame
+    and that the four role fields are strings. It cannot know whether the frame
+    holds one row per user per month, which is why ``validate_frame`` exists
+    further down and runs on the contents.
+
+    Attributes
+    ----------
+    frame : pandas.DataFrame
+        The rows, sorted by entity then time, with a clean 0..n-1 index.
+    target_column : str
+        Name of the column being predicted.
+    id_column : str
+        Name of the entity identifier column (one user, many months).
+    time_column : str
+        Name of the month column, dtype datetime64.
+    feature_columns : tuple of str
+        Names of the model input columns, in table order.
+    """
+
+    # arbitrary_types_allowed because pandas objects carry no pydantic schema.
+    # frozen so a split or a subset has to produce a new Dataset.
+    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
+
+    frame: pd.DataFrame
+    target_column: str
+    id_column: str
+    time_column: str
+    feature_columns: tuple[str, ...]
+
+    @property
+    def features(self) -> pd.DataFrame:
+        """Return the feature columns only.
+
+        Returns
+        -------
+        pandas.DataFrame
+            Shape (n_rows, n_features), columns in ``feature_columns`` order.
+        """
+        return self.frame.loc[:, list(self.feature_columns)]
+
+    @property
+    def target(self) -> pd.Series:
+        """Return the target column.
+
+        Returns
+        -------
+        pandas.Series
+            Float series of length n_rows, aligned to ``features``.
+        """
+        return self.frame[self.target_column]
+
+    @property
+    def entities(self) -> pd.Series:
+        """Return the entity identifier of every row.
+
+        Useful as the ``groups`` argument of any grouped cross-validator.
+
+        Returns
+        -------
+        pandas.Series
+            One entity id per row, aligned to ``features``.
+        """
+        return self.frame[self.id_column]
+
+    @property
+    def times(self) -> pd.Series:
+        """Return the month of every row.
+
+        Returns
+        -------
+        pandas.Series
+            datetime64 series, one month per row, aligned to ``features``.
+        """
+        return self.frame[self.time_column]
+
+    @property
+    def months(self) -> pd.DatetimeIndex:
+        """Return the distinct months present, in ascending order.
+
+        This is the axis a time-based split cuts along, so the splitter asks
+        for it here rather than re-deriving it.
+
+        Returns
+        -------
+        pandas.DatetimeIndex
+            Sorted unique months.
+        """
+        return pd.DatetimeIndex(self.times.drop_duplicates().sort_values())
+
+    @property
+    def n_rows(self) -> int:
+        """Return the number of rows.
+
+        Returns
+        -------
+        int
+            Row count of the wrapped frame.
+        """
+        return int(len(self.frame))
+
+    def take(self, positions: npt.NDArray[np.intp]) -> Dataset:
+        """Return the rows at the given positions as a new ``Dataset``.
+
+        Positional rather than label based, because the splitters produce
+        positions and a label lookup would go wrong the moment a caller hands
+        in a frame with a non-unique index.
+
+        Parameters
+        ----------
+        positions : numpy.ndarray of numpy.intp
+            Row positions to keep, in the order they should appear.
+
+        Returns
+        -------
+        Dataset
+            A new dataset over the selected rows, index reset to 0..k-1, with
+            the same column roles.
+        """
+        # copy() because a positional take can return a view, and a view handed
+        # to a transformer is where a partial write happens silently.
+        subset = self.frame.iloc[positions].copy().reset_index(drop=True)
+        return self.model_copy(update={"frame": subset})
+
+    def summary(self) -> str:
+        """Return a one-line description of the dataset.
+
+        Intended for the run log, so a run records what it was fitted on rather
+        than leaving that to be reconstructed afterwards.
+
+        Returns
+        -------
+        str
+            Rows, entities, month span and feature count.
+        """
+        months = self.months
+        span = f"{months[0]:%Y-%m} to {months[-1]:%Y-%m}" if len(months) else "none"
+        return (
+            f"{self.n_rows:,} rows, {self.entities.nunique():,} entities, "
+            f"{len(months)} months ({span}), {len(self.feature_columns)} features"
+        )
+
+
+def coerce_types(
+    frame: pd.DataFrame, id_column: str, time_column: str
+) -> pd.DataFrame:
+    """Return ``frame`` with the month parsed and every other column numeric.
+
+    Postgres ``numeric`` columns arrive as ``Decimal`` objects inside an
+    ``object`` column. Converting them here, once, at the point of entry, is
+    what keeps the rest of the pipeline free of dtype defence.
+
+    Parameters
+    ----------
+    frame : pandas.DataFrame
+        The frame as returned by the database.
+    id_column : str
+        Entity identifier column, left untouched (it is a uuid, not a number).
+    time_column : str
+        Month column, parsed to datetime64 and normalised to the month start.
+
+    Returns
+    -------
+    pandas.DataFrame
+        A new frame with the same columns and converted dtypes.
+
+    Raises
+    ------
+    ValueError
+        If a column that should be numeric holds values that cannot be
+        converted, or if the time column cannot be parsed as a date.
+    """
+    converted = frame.copy()
+
+    # Normalising to the month start means two rows for the same month can
+    # never land on opposite sides of a month boundary because one of them
+    # carried a time component.
+    parsed_time = pd.to_datetime(converted[time_column], errors="coerce")
+    unparsed = int((parsed_time.isna() & converted[time_column].notna()).sum())
+    if unparsed:
+        raise ValueError(
+            f"Column {time_column!r} holds values that are not dates; "
+            f"{unparsed} of {len(parsed_time)} failed to parse"
+        )
+    converted[time_column] = parsed_time.dt.to_period(MONTH_PERIOD).dt.to_timestamp()
+
+    # Everything except the id and the month is model input or the target, so
+    # all of it has to be numeric.
+    for column in converted.columns:
+        if column in (id_column, time_column):
+            continue
+        try:
+            converted[column] = pd.to_numeric(converted[column]).astype("float64")
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                f"Column {column!r} could not be converted to a number: {error}"
+            ) from error
+
+    return converted
+
+
+def resolve_feature_columns(
+    frame: pd.DataFrame,
+    target_column: str,
+    id_column: str,
+    time_column: str,
+    drop_columns: tuple[str, ...] = (),
+) -> tuple[str, ...]:
+    """Return the model feature columns, derived by exclusion.
+
+    A feature is any column that is not the target, not the entity id, not the
+    time column and not explicitly dropped. Derived rather than listed, so a
+    column added to the feature table reaches the model without a matching edit
+    here, which is the usual failure mode of a hardcoded list.
+
+    Parameters
+    ----------
+    frame : pandas.DataFrame
+        The coerced frame.
+    target_column : str
+        Name of the target column.
+    id_column : str
+        Name of the entity identifier column.
+    time_column : str
+        Name of the month column.
+    drop_columns : tuple of str, optional
+        Columns to exclude by hand, for example one half of a pair that says
+        the same thing twice. Default is no exclusions.
+
+    Returns
+    -------
+    tuple of str
+        Feature column names, in the order they appear in the frame.
+
+    Raises
+    ------
+    ValueError
+        If no feature columns survive the exclusions.
+    """
+    excluded = {target_column, id_column, time_column, *drop_columns}
+    features = tuple(str(column) for column in frame.columns if column not in excluded)
+    if not features:
+        raise ValueError(
+            "No feature columns left after exclusions; check data.drop_columns "
+            "in the config"
+        )
+    return features
+
+
+def validate_frame(
+    frame: pd.DataFrame, target_column: str, id_column: str, time_column: str
+) -> None:
+    """Check the structural assumptions the rest of the pipeline rests on.
+
+    Raises rather than warns. Each of these is a condition under which a later
+    number would still be produced but would not mean what it appears to mean,
+    and a wrong number that looks fine is worse than a stopped run.
+
+    Parameters
+    ----------
+    frame : pandas.DataFrame
+        The frame as returned by the database.
+    target_column : str
+        Name of the target column.
+    id_column : str
+        Name of the entity identifier column.
+    time_column : str
+        Name of the month column.
+
+    Returns
+    -------
+    None
+
+    Raises
+    ------
+    KeyError
+        If any of the three named columns is absent.
+    ValueError
+        If the frame is empty, if the time column is entirely missing, or if an
+        (entity, month) pair appears more than once.
+    """
+    missing = [
+        name
+        for name in (target_column, id_column, time_column)
+        if name not in frame.columns
+    ]
+    if missing:
+        raise KeyError(
+            f"Configured columns are not in the query result: {missing}. "
+            f"Available: {list(frame.columns)}"
+        )
+
+    if frame.empty:
+        raise ValueError("The query returned no rows")
+
+    if bool(frame[time_column].isna().all()):
+        raise ValueError(f"Column {time_column!r} is entirely missing")
+
+    # One row per user per month is the assumption a time split rests on: a
+    # duplicated pair would place the same month in train and in test.
+    duplicated = frame.duplicated(subset=[id_column, time_column])
+    if bool(duplicated.any()):
+        example = frame.loc[duplicated, [id_column, time_column]].head(3)
+        raise ValueError(
+            f"{int(duplicated.sum())} duplicate ({id_column}, {time_column}) rows; "
+            f"the table must hold one row per entity per month. "
+            f"First few:\n{example}"
+        )
+
+
+def unchanged_share_by_month(
+    dataset: Dataset, anchor_column: str, tolerance: float = 1e-6
+) -> pd.Series:
+    """Return the share of rows per month whose target did not move at all.
+
+    A diagnostic, not a rule. A month where almost every user's closing balance
+    equals last month's is not a month where nothing happened, it is a month
+    that was not finished when the table was built. Such a month makes any
+    persistence-flavoured predictor look near perfect, which is exactly the kind
+    of flattering number the brief warns about.
+
+    Parameters
+    ----------
+    dataset : Dataset
+        The panel to inspect.
+    anchor_column : str
+        Column holding last month's closing balance.
+    tolerance : float, optional
+        Absolute movement below this counts as no movement. Default 1e-6.
+
+    Returns
+    -------
+    pandas.Series
+        Share between 0 and 1, indexed by month, in month order. Empty when the
+        anchor column is absent.
+    """
+    if anchor_column not in dataset.frame.columns:
+        return pd.Series(dtype="float64")
+
+    movement = (dataset.target - dataset.frame[anchor_column]).abs()
+    unchanged = (movement <= tolerance) & movement.notna()
+    return unchanged.groupby(dataset.times).mean().sort_index()
+
+
+def suspicious_months(
+    dataset: Dataset, anchor_column: str, threshold: float = 0.9
+) -> pd.DatetimeIndex:
+    """Return months where nearly every target equals last month's balance.
+
+    Parameters
+    ----------
+    dataset : Dataset
+        The panel to inspect.
+    anchor_column : str
+        Column holding last month's closing balance.
+    threshold : float, optional
+        Share of unchanged rows above which a month is flagged. Default 0.9, so
+        a month of genuinely dormant users is not flagged while an unfinished
+        month is.
+
+    Returns
+    -------
+    pandas.DatetimeIndex
+        The flagged months, ascending.
+    """
+    shares = unchanged_share_by_month(dataset, anchor_column)
+    if shares.empty:
+        return pd.DatetimeIndex([])
+    return pd.DatetimeIndex(shares[shares >= threshold].index)
+
+
+def load_feature_frame(
+    config: dict[str, Any] | None = None, engine: Engine | None = None
+) -> pd.DataFrame:
+    """Run the configured query and return the raw result.
+
+    Kept separate from ``build_dataset`` so the notebook can look at exactly
+    what the database returned, before any coercion has had a chance to hide
+    something.
+
+    Parameters
+    ----------
+    config : dict, optional
+        Parsed config. Loaded from ``config/ml_config.yaml`` when omitted.
+    engine : sqlalchemy.engine.Engine, optional
+        Engine to read through. A new one is built when omitted.
+
+    Returns
+    -------
+    pandas.DataFrame
+        The query result, untouched.
+    """
+    settings = config if config is not None else load_config()
+    query = str(settings["data"]["query"])
+    return load_dataframe(query, engine=engine)
+
+
+def build_dataset(
+    config: dict[str, Any] | None = None,
+    engine: Engine | None = None,
+    frame: pd.DataFrame | None = None,
+) -> Dataset:
+    """Load, coerce, validate and sort the feature table into a ``Dataset``.
+
+    The single entry point used by both the notebook and the container job, so
+    that an experiment and a scheduled run start from identical inputs.
+
+    Parameters
+    ----------
+    config : dict, optional
+        Parsed config. Loaded from ``config/ml_config.yaml`` when omitted.
+    engine : sqlalchemy.engine.Engine, optional
+        Engine to read through. Ignored when ``frame`` is supplied.
+    frame : pandas.DataFrame, optional
+        An already-loaded frame to use instead of querying. Lets the notebook
+        re-run the checks on a subset without a second round trip.
+
+    Returns
+    -------
+    Dataset
+        Rows sorted by entity then month, index reset, roles assigned.
+
+    Raises
+    ------
+    KeyError
+        If a configured column is not present in the data.
+    ValueError
+        If the data fails one of the checks in ``validate_frame``, or if every
+        row is missing the target.
+    """
+    settings = config if config is not None else load_config()
+    data_settings = settings["data"]
+
+    target_column = str(data_settings["target_column"])
+    id_column = str(data_settings["id_column"])
+    time_column = str(data_settings["time_column"])
+    drop_columns = tuple(str(name) for name in data_settings.get("drop_columns") or ())
+    exclude_months = tuple(
+        pd.Timestamp(str(month)).to_period(MONTH_PERIOD).to_timestamp()
+        for month in data_settings.get("exclude_months") or ()
+    )
+
+    raw = frame if frame is not None else load_feature_frame(settings, engine=engine)
+
+    # Validate before coercing, so a missing column is reported as a missing
+    # column rather than as a conversion failure on a column that is not there.
+    validate_frame(raw, target_column, id_column, time_column)
+    typed = coerce_types(raw, id_column=id_column, time_column=time_column)
+
+    # A row without a target cannot be trained on and cannot be scored, and
+    # keeping it would let it count towards the size of a fold.
+    typed = typed.loc[typed[target_column].notna()]
+    if typed.empty:
+        raise ValueError(f"Every row is missing {target_column!r}")
+
+    # Months the config rules out, usually an unfinished one at the end of the
+    # panel. Dropped here rather than filtered in the SQL so the reason stays
+    # next to the measurement that justified it, and so the notebook can look
+    # at the excluded month by clearing one config key.
+    if exclude_months:
+        typed = typed.loc[~typed[time_column].isin(exclude_months)]
+        if typed.empty:
+            raise ValueError(
+                f"data.exclude_months removed every row; excluded {list(exclude_months)}"
+            )
+
+    # Sorted by entity then time: every downstream check that reasons about
+    # "the previous month" assumes this order, and sorting once here is cheaper
+    # than defending against it in each of them.
+    ordered = typed.sort_values([id_column, time_column]).reset_index(drop=True)
+
+    features = resolve_feature_columns(
+        ordered,
+        target_column=target_column,
+        id_column=id_column,
+        time_column=time_column,
+        drop_columns=drop_columns,
+    )
+    return Dataset(
+        frame=ordered,
+        target_column=target_column,
+        id_column=id_column,
+        time_column=time_column,
+        feature_columns=features,
+    )

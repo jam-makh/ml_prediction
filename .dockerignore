@@ -1,0 +1,27 @@
+# The Windows virtualenv holds win_amd64 binaries for numpy/scipy that cannot
+# run on the Linux base image. Copying it in would also silently shadow the
+# packages pip installs. Never send it to the daemon.
+.venv/
+
+# Build context is uploaded to the Docker daemon on every build; none of this
+# belongs in the image, and .git in particular is large and grows.
+.git/
+.gitignore
+
+# Bind-mounted at runtime instead of baked in, so copying them would only
+# create a stale second copy inside the image.
+data/
+models/
+notebooks/
+
+# Secrets. The container gets its configuration from compose's environment.
+.env
+
+# Local caches and editor droppings.
+**/__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+.pytest_cache/
+.vscode/
+.idea/

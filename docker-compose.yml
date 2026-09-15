@@ -1,36 +1,61 @@
-services:
-  postgres:
-    image: postgres:16
-    container_name: cleaning-postgres
-    restart: unless-stopped
-    ports:
-      # Host port -> container 5432. The right number is fixed: Postgres
-      # always serves 5432 inside the container, and nothing in there knows
-      # or cares what it is published as. The left comes from .env, defaulted
-      # to 5433 rather than 5432 because a native PostgreSQL 17 service is
-      # already holding 5432 on the development machine -- two servers cannot
-      # share a port, and stopping someone's other database is not a setup
-      # that reproduces. Every client reads POSTGRES_PORT from the same file,
-      # so the mapping and the connection string cannot drift apart.
-      - "${POSTGRES_PORT:-5433}:5432"
-    environment:
-      POSTGRES_USER: ${POSTGRES_USER:-pipeline}
-      # Defaulted so `docker compose up` works with no .env, but read from the
-      # environment first, which is where a real credential would come from.
-      # Nothing outside this machine can reach the port, so a weak local
-      # default is a convenience rather than an exposure.
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-pipeline}
-      POSTGRES_DB: ${POSTGRES_DB:-transactions}
-    volumes:
-      - pgdata:/var/lib/postgresql/data
-    healthcheck:
-      # Makes `docker compose ps` report "healthy" rather than merely
-      # "running" -- Postgres accepts a TCP connection several seconds before
-      # it will accept a query, and that gap is a confusing first failure.
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-pipeline} -d ${POSTGRES_DB:-transactions}"]
-      interval: 5s
-      timeout: 5s
-      retries: 10
+# This project does not run its own database. The training data lives in a
+# PostgreSQL that is already running on the host and published on port 5433;
+# the job here only reads a table from it.
+#
+# That leaves exactly one service: the training job.
 
-volumes:
-  pgdata:
+services:
+  # The production-shaped half of the pipeline: a batch job, not a server.
+  # Exploration happens in a local notebook against the same code in src/;
+  # this runs the settled version the way a scheduled job would.
+  #
+  #   docker compose run --rm train
+  #
+  # `docker-compose` with a hyphen reaches the same plugin on a current Docker
+  # and works too; the hyphenless form is the one that stays. The filename this
+  # is written in is unrelated to that -- compose finds compose.yaml,
+  # compose.yml, docker-compose.yaml and docker-compose.yml alike.
+  #
+  # --rm because each run is disposable. Everything worth keeping is written
+  # to the bind-mounted ./models on the host, not into the container.
+  train:
+    build: .
+    image: ml-prediction-train
+    environment:
+      # Credentials for the EXISTING database, set in .env. The `:?` form is
+      # what makes a missing .env fail loudly: without it compose substitutes
+      # an empty string, the container starts, and the run dies several seconds
+      # later on a Postgres authentication error that says nothing about the
+      # actual cause.
+      POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER in .env (see .env.example)}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env (see .env.example)}
+      POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB in .env (see .env.example)}
+
+      # THE IMPORTANT PART. "localhost" inside a container means the container
+      # itself, not your machine -- so the notebook's localhost:5433 cannot be
+      # reused here. Docker Desktop resolves host.docker.internal to the host,
+      # which is where the database is actually listening.
+      #
+      #   Local notebook  ->  localhost:5433
+      #   This container  ->  host.docker.internal:5433
+      #
+      # Same database, same published port; only the hostname differs. That is
+      # why src/config/config.py reads both from the environment instead of
+      # hardcoding either one.
+      POSTGRES_HOST: host.docker.internal
+      POSTGRES_PORT: ${POSTGRES_PORT:-5433}
+    extra_hosts:
+      # Docker Desktop provides host.docker.internal automatically; this line
+      # makes the same compose file work on native Linux, where it is not
+      # defined by default.
+      - "host.docker.internal:host-gateway"
+    volumes:
+      # Code is mounted, not baked into the image, so an edit on the host
+      # takes effect on the next run with no rebuild. Read-only because the
+      # job has no business rewriting its own source or config.
+      - ./src:/app/src:ro
+      - ./config:/app/config:ro
+      # Writable: this is where trained models land, and the whole point is
+      # that they outlive the container.
+      - ./models:/app/models
+    # No `ports`. This is a job that runs and exits, not a service to reach.

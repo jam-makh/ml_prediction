@@ -1,2 +1,22 @@
 .venv/
+__pycache__/
+*.pyc
+*.pyo
 .env
+
+# Inputs and trained artefacts are data, not source. Both are reproducible:
+# data comes from Postgres, models from `docker compose run --rm train`.
+# The directories themselves are kept (via .gitkeep) so a fresh clone has the
+# bind-mount targets compose expects -- Docker would otherwise create them
+# as root-owned.
+data/*
+!data/.gitkeep
+models/*
+!models/.gitkeep
+
+.ipynb_checkpoints/
+.pytest_cache/
+Stage5_Forecast_The_Balance.pdf
+.mypy_cache/
+models/
+mypy.ini

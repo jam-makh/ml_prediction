@@ -1,0 +1,52 @@
+# Runtime dependencies for the training job. Installed by BOTH the Docker
+# image and the local .venv, which is what keeps "it worked in my notebook"
+# and "it worked in the container" the same claim.
+#
+# Every version is pinned exactly so a rebuild in six months produces the same
+# numbers. Adding a dependency means adding a line here with an explicit
+# version and rebuilding the image.
+#
+# NOTE: keep this file UTF-8 with LF endings. PowerShell's `pip freeze >
+# requirements.txt` writes UTF-16, which pip inside the Linux container cannot
+# parse. Use `pip freeze | Out-File -Encoding utf8 requirements.txt` instead.
+
+# --- Core modelling -------------------------------------------------------
+scikit-learn==1.9.0
+# Boosted trees. Handles NaN natively, which is why src/xgboost_model.py feeds
+# it the raw feature frame instead of running it through the imputer.
+xgboost==3.4.1
+numpy==2.5.3
+scipy==1.18.1
+joblib==1.6.0
+
+# --- Dataframes -----------------------------------------------------------
+pandas==3.0.5
+
+# --- Postgres access ------------------------------------------------------
+# psycopg2-binary ships a precompiled extension, so the image needs only the
+# libpq5 runtime library and no C toolchain.
+SQLAlchemy==2.0.52
+psycopg2-binary==2.9.13
+
+# --- Configuration --------------------------------------------------------
+# pydantic validates the config blocks and the objects passed between the
+# pipeline stages, so a bad value fails at the boundary with a readable message
+# rather than deep inside a fit.
+PyYAML==6.0.3
+python-dotenv==1.2.3
+pydantic==2.13.5
+
+# --- Plots for feature selection -----------------------------------------
+matplotlib==3.11.1
+seaborn==0.13.2
+
+# --- Transitive, pinned for a complete lock -------------------------------
+# Not imported directly: cloudpickle is pulled in by joblib, narwhals by
+# scikit-learn, and the rest by pydantic. Pinned so the environment is fully
+# reproducible.
+annotated-types==0.8.0
+cloudpickle==3.1.2
+narwhals==2.26.0
+pydantic-core==2.46.5
+threadpoolctl==3.6.0
+typing-inspection==0.4.4

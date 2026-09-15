@@ -1,0 +1,338 @@
+"""Gradient boosted trees, kept deliberately small.
+
+The model that can find things a linear fit cannot: a threshold effect, an
+interaction between spend and balance, a rule that only applies to users with
+many accounts. Those are plausible here, which is why it earns a place. A model
+that cannot be explained to a stakeholder is a liability in a bank, so the bar is
+not "does it fit" but "does it beat the linear model by enough to be worth the
+loss of explanation".
+
+The defaults below are shallow trees, a low learning rate and subsampling --
+the shape that generalises on a few thousand rows. They are named constructor
+arguments rather than a module-level dict, so there is exactly one place to read
+them from, and the config carries only what a given run overrides.
+
+**No preprocessing.** XGBoost handles missing values natively: each split learns
+a default direction for NaN, which is strictly more informative than replacing
+the gap with a median first. Trees split on order rather than magnitude, so
+scaling changes nothing. Running the features through a pipeline anyway would
+add a fitted median the model does not need and throw away the signal that a
+value was missing at all -- which here means "this user is new".
+
+**Two things are chosen rather than guessed.** ``n_estimators`` comes from early
+stopping, not from the search: searching a parameter with a monotone best answer
+wastes draws the other six axes could use. It is stopped once per fold and the
+median count kept, because a single fold's window is 450 rows and stopping on
+one of them chose a single round -- a model that predicts the average movement
+and nothing else. Everything else comes from a randomised search over the same
+expanding month folds. Both are skipped when the config gives no ``search``
+block, which makes a fixed-parameter run a one-line config change.
+
+**Importance is gain.** The total improvement in the loss that each feature's
+splits bought. Preferred over ``weight``, which counts how often a feature was
+split on and so rewards high-cardinality columns for being easy to split rather
+than useful, and over ``cover``, which counts rows touched.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+import numpy as np
+import numpy.typing as npt
+import pandas as pd
+from xgboost import XGBRegressor
+
+from src.data.data import Dataset
+from src.models_code.base_class import AnchoredModel, TargetMode
+
+# Upper bound while early stopping is running, not a target. High enough that a
+# low learning rate can still converge; the stopper decides where to stop.
+EARLY_STOPPING_CAP = 2_000
+
+# Rounds without improvement before the fit gives up. Fifty is loose enough to
+# ride out the noise of a three-month eval window.
+EARLY_STOPPING_ROUNDS = 50
+
+
+class XGBoostModel(AnchoredModel):
+    """Gradient boosted trees over the feature table.
+
+    Parameters
+    ----------
+    name : str, optional
+        Label for result tables. Default ``xgboost``.
+    target_mode : str, optional
+        ``level`` or ``change``. Default ``change``.
+    anchor_column : str, optional
+        Column holding last month's balance, read only in change mode.
+    search : dict, optional
+        The spec's ``search`` block. None means fixed parameters, no search and
+        no early stopping.
+    n_estimators : int, optional
+        Boosting rounds when nothing is searched. Default 300. Ignored once
+        early stopping has chosen a count.
+    max_depth : int, optional
+        Tree depth. Default 4 -- deep enough for an interaction, shallow enough
+        not to memorise five thousand rows.
+    learning_rate : float, optional
+        Default 0.05.
+    subsample : float, optional
+        Row sample per tree. Default 0.8.
+    colsample_bytree : float, optional
+        Column sample per tree. Default 0.8.
+    min_child_weight : float, optional
+        Minimum summed instance weight in a leaf. Default 5.0.
+    reg_lambda : float, optional
+        L2 penalty on leaf weights. Default 1.0.
+    random_state : int, optional
+        Default 42.
+    n_jobs : int, optional
+        Default 1. Single threaded so two runs of one config produce the same
+        numbers: tree building is order-dependent across threads, and a model
+        comparison that shifts between runs is one nobody can act on.
+    **params : Any
+        Anything else, passed straight to ``XGBRegressor``.
+
+    Attributes
+    ----------
+    best_params_ : dict or None
+        What the search settled on, or None when no search ran.
+    best_iteration_ : int or None
+        Rounds early stopping chose -- the median across folds -- or None when
+        it did not run.
+    stopping_rounds_ : list of int
+        The per-fold counts that median came from. Worth reading: if they
+        disagree wildly, the round count is not a stable property of this data
+        and the booster is being sized by whichever quarter it happened to see.
+    """
+
+    def __init__(
+        self,
+        name: str = "xgboost",
+        target_mode: TargetMode = "change",
+        anchor_column: str = "prev_1m_closing_balance_usd",
+        search: dict[str, Any] | None = None,
+        n_estimators: int = 300,
+        max_depth: int = 4,
+        learning_rate: float = 0.05,
+        subsample: float = 0.8,
+        colsample_bytree: float = 0.8,
+        min_child_weight: float = 5.0,
+        reg_lambda: float = 1.0,
+        random_state: int = 42,
+        n_jobs: int = 1,
+        **params: Any,
+    ) -> None:
+        super().__init__(
+            name,
+            target_mode=target_mode,
+            anchor_column=anchor_column,
+            search=search,
+        )
+        self.random_state = random_state
+        self.params: dict[str, Any] = {
+            "n_estimators": n_estimators,
+            "max_depth": max_depth,
+            "learning_rate": learning_rate,
+            "subsample": subsample,
+            "colsample_bytree": colsample_bytree,
+            "min_child_weight": min_child_weight,
+            "reg_lambda": reg_lambda,
+            "random_state": random_state,
+            "n_jobs": n_jobs,
+            **params,
+        }
+
+        self.best_iteration_: int | None = None
+        self.stopping_rounds_: list[int] = []
+        self._estimator: XGBRegressor | None = None
+
+    def _build(self, **overrides: Any) -> XGBRegressor:
+        """Return an unfitted regressor with the current parameters.
+
+        Parameters
+        ----------
+        **overrides : Any
+            Applied on top of the stored parameters.
+
+        Returns
+        -------
+        xgboost.XGBRegressor
+            Unfitted.
+        """
+        return XGBRegressor(**{**self.params, **overrides})
+
+    def _fit(self, dataset: Dataset) -> None:
+        """Search, early-stop, then refit on every training row.
+
+        Parameters
+        ----------
+        dataset : Dataset
+            Training rows.
+
+        Returns
+        -------
+        None
+
+        Raises
+        ------
+        ValueError
+            If no rows have a usable target.
+        """
+        target = self._training_target(dataset)
+        usable = self._usable_rows(target)
+
+        features = dataset.features.loc[usable]
+        values = target.to_numpy(dtype="float64")[usable]
+        months = dataset.frame[dataset.time_column].loc[usable].reset_index(drop=True)
+
+        if self.search:
+            self._search_and_stop(features, values, months)
+
+        # The final fit, on every training row. When early stopping ran, the
+        # round count it found is fixed here and the eval set is gone -- the
+        # model that produces the reported number should see all the history
+        # there is, right up to the cut.
+        rounds = self.best_iteration_ or self.params["n_estimators"]
+        self._estimator = self._build(
+            n_estimators=rounds, early_stopping_rounds=None
+        )
+        self._estimator.fit(features, values)
+
+    def _search_and_stop(
+        self,
+        features: pd.DataFrame,
+        values: npt.NDArray[np.float64],
+        months: pd.Series,
+    ) -> None:
+        """Pick parameters by randomised search, then a round count by stopping.
+
+        Parameters
+        ----------
+        features : pandas.DataFrame
+            Training features, usable rows only.
+        values : numpy.ndarray of float
+            Training target, aligned to ``features``.
+        months : pandas.Series
+            Month per row, aligned to ``features``, index reset.
+
+        Returns
+        -------
+        None
+        """
+        # Imported here rather than at module scope: tuning imports splitting,
+        # and a top-level import would make this module depend on the search
+        # machinery just to define the class.
+        from src.tuning import month_folds, run_search
+
+        folds = month_folds(months, n_folds=3, test_months=3)
+        if not folds:
+            # Too little history to fold. Better a fixed-parameter model than a
+            # search over one arbitrary split.
+            return
+
+        best, score = run_search(
+            estimator=self._build(),
+            features=features,
+            target=values,
+            folds=folds,
+            search=self.search,
+            random_state=self.random_state,
+        )
+        self.params.update(best)
+        self.best_params_ = best
+        self.search_cv_score_ = score
+
+        # Early stopping, once per fold, and the median of the counts is kept.
+        #
+        # Not the last fold alone, which is what this did first: a fold's test
+        # window is 450 rows over three months, and on a target where a handful
+        # of users own most of the error that is far too little to stop on. It
+        # showed: stopping on the last window alone chose 1 round, which is a
+        # model that predicts the mean movement and nothing else -- while the
+        # cross-validated score over all five folds says the booster does beat
+        # a zero-change prediction. One window was not measuring what the
+        # comparison was measuring. Three windows and a median is still cheap,
+        # since this is one fit per fold, and it cannot be swung by one quiet
+        # quarter.
+        rounds: list[int] = []
+        for train_idx, eval_idx in folds:
+            stopper = self._build(
+                n_estimators=EARLY_STOPPING_CAP,
+                early_stopping_rounds=EARLY_STOPPING_ROUNDS,
+            )
+            stopper.fit(
+                features.iloc[train_idx],
+                values[train_idx],
+                eval_set=[(features.iloc[eval_idx], values[eval_idx])],
+                verbose=False,
+            )
+            # +1 because best_iteration is a zero-based index into the rounds.
+            rounds.append(int(stopper.best_iteration) + 1)
+
+        self.best_iteration_ = int(np.median(rounds))
+        self.stopping_rounds_ = rounds
+
+    def _predict(self, dataset: Dataset) -> npt.NDArray[np.float64]:
+        """Predict, putting the level back together in change mode.
+
+        Parameters
+        ----------
+        dataset : Dataset
+            Rows to predict for.
+
+        Returns
+        -------
+        numpy.ndarray of float
+            One prediction per row, on the balance scale in both modes.
+        """
+        assert self._estimator is not None  # guaranteed by Model.predict
+        predicted = np.asarray(
+            self._estimator.predict(dataset.features), dtype="float64"
+        )
+        return self._restore_level(dataset, predicted)
+
+    def feature_importance(self) -> pd.Series | None:
+        """Return importance by gain, largest first.
+
+        Returns
+        -------
+        pandas.Series or None
+            Gain per feature name, descending, or None before fitting. Features
+            the booster never split on appear at zero rather than being
+            dropped, so the series always covers every input column -- which is
+            what makes it an answer to "which columns carry the model" rather
+            than only a list of the ones that do.
+        """
+        if not self.is_fitted or self._estimator is None:
+            return None
+
+        scores = self._estimator.get_booster().get_score(importance_type="gain")
+        gains = pd.Series(
+            {name: float(value) for name, value in scores.items()}, dtype="float64"
+        )
+        complete = gains.reindex(list(self._feature_columns), fill_value=0.0)
+        complete.name = "gain"
+        return complete.sort_values(ascending=False)
+
+    def describe(self) -> str:
+        """Return a one-line description for the run log.
+
+        Returns
+        -------
+        str
+            Shape of the booster, target mode, and how many features it used.
+        """
+        if not self.is_fitted:
+            return f"{self.name} (not fitted)"
+        importance = self.feature_importance()
+        used = int((importance > 0).sum()) if importance is not None else 0
+        rounds = self.best_iteration_ or self.params["n_estimators"]
+        stopped = " (early stopped)" if self.best_iteration_ else ""
+        return (
+            f"{self.name}: {rounds} trees{stopped}, depth "
+            f"{self.params['max_depth']}, lr {self.params['learning_rate']:g}, "
+            f"target={self.target_mode}, split on {used} of "
+            f"{len(self._feature_columns)} features"
+        )

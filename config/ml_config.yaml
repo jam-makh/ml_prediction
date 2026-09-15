@@ -1,0 +1,181 @@
+data:
+  # Pulled straight into pandas. Feature engineering that must also run at
+  # prediction time stays in Python rather than SQL, so it cannot be forgotten.
+  # Reads the existing PostgreSQL on localhost:5433.
+  query: |
+    SELECT *
+    FROM feature_store_monthly
+
+  # The three columns that are neither features nor model inputs.
+  # src/data/data.py derives the feature list by exclusion -- anything that is
+  # not one of these three (or listed in drop_columns) is a model input -- so a
+  # column added to the feature table reaches the model without a code change.
+  target_column: target_closing_balance_usd
+  id_column: user_id     # metadata: stays in the frame, never a feature
+  time_column: month     # the only date column; already excluded as the time axis
+
+  # ---------------------------------------------------------------------------
+  # Columns no model sees. Chosen in notebooks/feature_selection_exp.ipynb from
+  # Pearson + Spearman against the target and the >0.90 pair check.
+  #
+  # Every entry is justified by a measurement taken over all 6,300 rows.
+  # ---------------------------------------------------------------------------
+  drop_columns:
+    # Exactly reconstructable from columns that stay -- dropping loses nothing.
+    - prev_1m_total_spend_usd          # == sum of the 7 prev_1m_spend_*_usd    (max diff 2.3e-10)
+    - roll3_mean_closing_balance_usd   # == mean of the 3 prev_Nm_closing_balance lags (3.3e-05)
+
+    # Near-duplicates of their own 1-month lag. Redundant in practice, not
+    # exact: there are no prev_2m/prev_3m credited or debited columns, so these
+    # are the only 3-month view of flow.
+    - roll3_mean_total_credited_usd    # r=0.956 / rho=0.874 vs prev_1m_total_credited_usd
+    - roll3_mean_total_debited_usd     # r=0.792 / rho=0.899 vs prev_1m_total_debited_usd
+
+    # MEASURED, NOT YET ACTED ON. With the four drops above the feature matrix
+    # is still rank 19 of 21: two exact identities survive, both verified to
+    # 1e-10 over every row.
+    #
+    #   delta_prev_1m_2m_closing_balance_usd = prev_1m_closing_balance_usd
+    #                                        - prev_2m_closing_balance_usd
+    #   prev_1m_net_flow_usd = prev_1m_total_credited_usd
+    #                        - prev_1m_total_debited_usd
+    #
+    # Both are exactly reconstructable, so uncommenting these two costs nothing
+    # and takes the table to 19 features at full rank 19. Until then
+    # ridge_change has no unique solution and its individual coefficients should
+    # not be read one by one. A tree is unaffected either way: it cannot cheaply
+    # build a difference of two columns, so the derived column may be carrying
+    # real signal for XGBoost.
+    # - delta_prev_1m_2m_closing_balance_usd
+    # - prev_1m_net_flow_usd
+
+  # Months excluded from the panel entirely.
+  #
+  # 2025-07 is excluded on a measurement: 149 of its 150 rows have a closing
+  # balance identical to the previous month's, and its mean absolute
+  # month-on-month change is 0.66 USD against roughly 20,000 USD in every other
+  # month. That is an unfinished month in the source table, not a quiet one.
+  # Left in, it hands any persistence-flavoured model a near-perfect month.
+  # src/train.py re-runs the check on every run and warns if another month
+  # starts to look like this.
+  exclude_months:
+    - 2025-07
+
+  # Read by the training path and handed to every model that takes a seed.
+  random_state: 42
+
+split:
+  # There is deliberately no test_size. A random fraction of the rows would put
+  # a user's later months in train and their earlier months in test, which lets
+  # the model see the future. Every split cuts along the month axis instead --
+  # see src/splitting.py.
+  #
+  # 42 usable months, so 34 train / 8 test is 81/19: the closest clean landing
+  # on 80/20 (33/9 would be 78.6/21.4).
+  test_months: 8
+
+  # Months discarded between train and test. Zero is correct while every feature
+  # is a lag or rolling window over strictly earlier months: a model predicting
+  # month t then uses only what genuinely existed on day one of month t. Raise
+  # it the moment a feature is computed from the target month.
+  gap_months: 0
+
+  # Expanding-window cross-validation inside the 34 training months. Five folds
+  # of three months each: fold_1 trains on months 1-19 and tests 20-22, through
+  # fold_5 which trains on 1-31 and tests 32-34. There is no separate validation
+  # block -- these folds are what stands in for one, and fold_5's window is the
+  # eval set XGBoost early-stops against.
+  cv_folds: 5
+  cv_test_months: 3
+
+  # A fold with a shorter training window than this is not produced. The
+  # earliest fold gets 19 months, so this is a guard rather than a constraint.
+  min_train_months: 6
+
+models:
+  # Each entry becomes one fitted, scored candidate. `name` is free text, used
+  # in result tables and saved filenames; `kind` picks the constructor from
+  # MODEL_REGISTRY in src/train.py; `params` passes straight to it.
+  #
+  # Order of work: the trivial predictors first, so there is a bar before there
+  # is a model, then the linear fit, then the trees.
+
+  # Average of the last three closing balances. The headline baseline.
+  - name: three_month_average
+    kind: lag_average
+    params: {n_months: 3}
+
+  # Last month's balance, unchanged. On a series this autocorrelated it is
+  # usually the harder of the two baselines to beat -- on the last recorded run
+  # it beat every fitted model.
+  - name: persistence
+    kind: lag_average
+    params: {n_months: 1}
+
+  # Ridge on the movement, alpha chosen by RidgeCV over the folds above.
+  #
+  # Ridge rather than OLS or Lasso: the balance lags stay strongly correlated
+  # even once they are no longer exactly collinear. OLS has no unique solution
+  # while the matrix is rank deficient, and Lasso picks one member of a
+  # correlated group essentially at random, with the pick flipping between folds.
+  #
+  # Change mode rather than level: on this panel the level is almost entirely
+  # last month's balance, so a model fitted on the level spends its capacity
+  # rediscovering that.
+  - name: ridge_change
+    kind: ridge
+    params:
+      target_mode: change
+
+  # Boosted trees on the movement. Small on purpose -- about five thousand
+  # training rows. It has to beat ridge_change by enough to be worth losing the
+  # explanation.
+  #
+  # `search` is the RandomizedSearchCV space, run over the expanding folds
+  # above. A list is a discrete choice; a {low, high} mapping becomes a
+  # continuous distribution (loguniform when log: true, else uniform).
+  # n_estimators is absent on purpose: early stopping sets it, nothing searches
+  # it. Delete the whole `search` block to run fixed defaults instead.
+  - name: xgboost_change
+    kind: xgboost
+    params:
+      target_mode: change
+    search:
+      # 20 draws over six axes. Measured at about 2.5s per candidate on this
+      # data, and the search re-runs inside every fold so nothing tuned on a
+      # fold's own test months -- 5 CV folds plus the final fit is six searches,
+      # so roughly five minutes. Raise it for a final run; lower it, not the
+      # fold count, if that gets in the way while iterating.
+      n_iter: 20
+      scoring: neg_median_absolute_error   # matches evaluation.headline_metric
+      space:
+        max_depth:        [3, 4, 5, 6]
+        learning_rate:    {low: 0.01, high: 0.2, log: true}
+        subsample:        {low: 0.6, high: 1.0}
+        colsample_bytree: {low: 0.6, high: 1.0}
+        min_child_weight: [1, 5, 10, 20]
+        reg_lambda:       {low: 0.1, high: 10.0, log: true}
+
+evaluation:
+  # Every skill score is measured against this model, so it has to name one of
+  # the entries above.
+  reference_model: three_month_average
+
+  # Last month's balance. The change framing subtracts it from both the truth
+  # and the prediction, which stops a flattering R squared on the level hiding
+  # the difference between models. See the docstring in src/metrics.py.
+  anchor_column: prev_1m_closing_balance_usd
+
+  # Rows with a smaller absolute balance than this are left out of the
+  # percentage error, which would otherwise explode on balances near zero.
+  mape_floor: 1000.0
+
+  # Which column the comparison is ranked on. median_ae rather than rmse: on the
+  # holdout the ten worst users carry 73% of the total squared error, so ranking
+  # on RMSE ranks models by how well they fit ten accounts out of 150. Set to
+  # rmse for the conventional ordering, or p90_ae to rank on the tail.
+  headline_metric: median_ae
+
+output:
+  # Relative to /app in the container, which is the bind-mounted ./models.
+  model_dir: models

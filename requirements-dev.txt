@@ -1,0 +1,20 @@
+# Local development only -- the Docker image never installs this file. There
+# is no reason to ship a notebook server inside a batch-job image.
+#
+# Install locally with:  pip install -r requirements-dev.txt
+# That pulls in requirements.txt too, so the notebook runs the exact same
+# library versions the container does.
+
+-r requirements.txt
+
+jupyterlab==4.6.3
+ipykernel==7.3.0
+
+# Type checking for src/, which is the code the container runs unattended.
+# Run with:  mypy src          (settings live in mypy.ini)
+# The stub packages are what make the check worth anything: without them
+# pandas and PyYAML are untyped, every call returns Any, and strict mode passes
+# by knowing nothing.
+mypy==2.3.1
+pandas-stubs==3.0.5.260730
+types-PyYAML==6.0.12.20260906
