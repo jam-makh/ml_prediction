@@ -480,16 +480,35 @@ models:
         min_child_weight: [1, 5, 10, 20]
         reg_lambda:       {low: 0.1, high: 10.0, log: true}
 
+  # DROPPED, and the measurement that dropped it.
+  #
   # The log framing from the brief, made usable on a target that goes negative:
-  # sign(x)*log1p(|x|) instead of log(1+x). Kept as a candidate rather than the
-  # default because its inverse is sensitive near zero, where a fair number of
-  # these accounts sit -- it is here to be measured against ridge_scaled, not
-  # assumed better.
-  - name: xgboost_signed_log
-    kind: xgboost
-    params:
-      target_mode: signed_log_change
-      objective: reg:absoluteerror
+  # sign(x)*log1p(|x|) instead of log(1+x). It was here to be measured rather
+  # than assumed better, and it was measured:
+  #
+  #   model                test_wape  test_r2_change  skill  train/test gap
+  #   xgboost_change          18.045           0.001  0.212           5.956
+  #   xgboost_scaled          18.114           0.002  0.212           6.363
+  #   xgboost_signed_log      21.408          -0.318  0.095           7.845
+  #
+  # Worst WAPE, the only negative r2_change of the three, and the widest
+  # train/test gap despite the LOWEST training error -- which is what
+  # overfitting looks like. That is the predicted failure: the inverse is
+  # sensitive near zero and a fair number of these accounts sit there, so
+  # small errors in log space become large ones in dollars.
+  #
+  # Two caveats kept on the record, because they are reasons the number is not
+  # a clean verdict: it never had a `search` block, so it ran fixed defaults
+  # while the other two got 20 tuning draws; and it was scored on a single
+  # 8-month holdout window on which the baseline itself posted r2_change
+  # -0.608. Restore the block below, add a `search` block matching the others,
+  # and re-measure before concluding the framing itself is wrong.
+  #
+  #- name: xgboost_signed_log
+  #  kind: xgboost
+  #  params:
+  #    target_mode: signed_log_change
+  #    objective: reg:absoluteerror
 
 output:
   # Relative to /app in the container, which is the bind-mounted ./models.
