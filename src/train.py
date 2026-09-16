@@ -1,45 +1,56 @@
-"""The entry point the container runs: fit every configured model and score it.
+"""Fit every configured model and save it. Scoring happens in ``test.py``.
+
+This script never touches the holdout. It cuts the holdout off at the start,
+hands the training region to everything below, and the held-out months are not
+read again by any line in this file. That is the entire reason training and
+testing are two scripts: a script that both fits and reports the headline
+number can always be edited into one that reports a number it fitted on, and
+the edit does not look like a mistake.
 
 One pass, in this order:
 
 1. Load the feature table and turn it into a ``Dataset``.
-2. Cut the last months off as a holdout. Nothing below ever reads them until
-   the final scoring step.
-3. Cross-validate every model on expanding windows inside the training region.
-   This is the number used to compare models, because it averages over several
-   periods instead of betting the comparison on one.
-4. Refit each model on the whole training region and score it once on the
-   holdout. This is the number reported, and it is produced exactly once.
-5. Seal each fitted model with ``save_model`` and write a JSON run summary.
+2. Cut the last months off as a holdout, and keep only the training region.
+3. Cross-validate every model on expanding windows *inside* that region. This
+   is the number used to choose between models, because it averages over
+   several periods instead of betting the comparison on one.
+4. Refit each model on the whole training region.
+5. Save each fitted model as a single file.
 
 Every model is rebuilt from scratch for each fold. Reusing a fitted instance
 would carry fold 1's learned statistics into fold 2, which is the same leak as
 fitting a scaler before the split, just harder to see.
 
-Every model is reported with both R squareds, the flattering one against the
-balance level and the honest one against the movement. See ``metrics.py`` for
-why quoting only the first would make every model here look excellent, the
-trivial baseline included.
+**What the saved file carries.** Each model pickles itself whole, including the
+months it was fitted on. ``test.py`` reads that and scores everything strictly
+after it, so the train/test boundary is a fact produced by the fit rather than a
+cut-off recomputed from config in two places. Change ``split.test_months``
+between a train run and a test run and nothing silently moves: the models still
+say where they stopped.
+
+**Feature selection does not happen here.** The feature set comes from the
+``features`` block of the config, which is where ``features_selection.py``'s
+answer was pasted after someone read it. Re-selecting on every training run
+would make two runs over the same data disagree, and would quietly give the
+booster extra attempts to fit the folds that the baseline never got.
 
 Before any of that, the run checks whether a month's targets simply repeat the
 previous month's balances, which is what an unfinished month in the source
 table looks like from here. That check is why 2025-07 is excluded in the config.
 
-The holdout scoring goes through ``evaluate.py`` rather than calling
-``metrics.py`` directly, so the out-of-sample assertion and the per-month and
-per-user breakdowns happen on the numbers that actually get quoted.
-
 Run it with::
 
     docker compose run --rm train
     python -m src.train            # locally, same code path
+
+then score what it saved::
+
+    python -m src.test
 """
 
 from __future__ import annotations
 
-import json
 from collections.abc import Callable
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -49,18 +60,21 @@ import pandas as pd
 from pydantic import BaseModel, ConfigDict, Field
 
 from src.config.config import load_config, resolve_output_dir
-from src.data.data import Dataset, build_dataset, suspicious_months, unchanged_share_by_month
-from src.evaluate import evaluate_models, report_table, worst_months_table, worst_users_table
+from src.data.data import (
+    Dataset,
+    build_dataset,
+    suspicious_months,
+    unchanged_share_by_month,
+)
+from src.evaluate import EvaluationSettings
 from src.metrics import Scores, anchor_values, score
 from src.models_code.base_class import Model, ModelFactory
 from src.models_code.baseline import LagAverageBaseline
 from src.models_code.mlr import RidgeRegression
 from src.models_code.xgboost_model import XGBoostModel
-from src.save_model import save_model
-from src.splitting import (
+from src.window import (
     Split,
     SplitSettings,
-    check_no_future_leak,
     expanding_folds,
     holdout_split,
 )
@@ -87,13 +101,36 @@ MODEL_REGISTRY: dict[str, Callable[..., Model]] = {
 RUN_DEFAULTS = ("random_state", "anchor_column")
 
 
+def model_path(output_dir: Path, name: str) -> Path:
+    """Return the file a model of this name is saved to.
+
+    One file per model, overwritten on every run. Named from the model rather
+    than from a timestamp, so ``test.py`` can find it without being told which
+    run to look at, and so a stale artefact from a config that no longer exists
+    cannot be picked up by accident.
+
+    Parameters
+    ----------
+    output_dir : pathlib.Path
+        Directory models are written to.
+    name : str
+        The model's name from the config.
+
+    Returns
+    -------
+    pathlib.Path
+        The destination path.
+    """
+    return output_dir / f"{name}.joblib"
+
+
 class ModelSpec(BaseModel):
     """One entry from the ``models`` block of the config.
 
     Attributes
     ----------
     name : str
-        Label used in result tables and saved filenames. Unique within a run.
+        Label used in result tables and the saved filename. Unique within a run.
     kind : str
         Which constructor to use, a key of ``MODEL_REGISTRY``.
     params : dict
@@ -167,49 +204,6 @@ class ModelSpec(BaseModel):
         return build
 
 
-class EvaluationSettings(BaseModel):
-    """The ``evaluation`` block of the config.
-
-    Attributes
-    ----------
-    reference_model : str
-        Name of the model every skill score is measured against. Normally the
-        3-month average, since that is the bar the brief sets.
-    anchor_column : str
-        Column holding last month's balance, used by the change framing.
-    mape_floor : float
-        Rows with a smaller absolute true value are left out of the percentage
-        error.
-    headline_metric : str
-        Which column the comparison table is ranked on. Defaults to the median
-        absolute error, since on a target this skewed RMSE ranks models by how
-        well they fit the largest handful of accounts.
-    """
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    reference_model: str = "three_month_average"
-    anchor_column: str = "prev_1m_closing_balance_usd"
-    mape_floor: float = 1_000.0
-    headline_metric: str = "median_ae"
-
-    @classmethod
-    def from_config(cls, config: dict[str, Any]) -> EvaluationSettings:
-        """Build settings from a parsed config.
-
-        Parameters
-        ----------
-        config : dict
-            Parsed config. A missing ``evaluation`` block gives defaults.
-
-        Returns
-        -------
-        EvaluationSettings
-            Validated settings.
-        """
-        return cls.model_validate(config.get("evaluation") or {})
-
-
 def read_model_specs(config: dict[str, Any]) -> list[ModelSpec]:
     """Parse the ``models`` block into validated specs.
 
@@ -236,8 +230,8 @@ def read_model_specs(config: dict[str, Any]) -> list[ModelSpec]:
     names = [spec.name for spec in specs]
     duplicates = {name for name in names if names.count(name) > 1}
     if duplicates:
-        # Two models sharing a name would overwrite each other in every result
-        # dict keyed by name, and the run would silently report one of them.
+        # Two models sharing a name would overwrite each other's saved file and
+        # each other's row in every result table keyed by name.
         raise ValueError(f"Model names must be unique; repeated: {sorted(duplicates)}")
     return specs
 
@@ -260,13 +254,6 @@ def fit_and_predict(
     -------
     tuple of (Model, numpy.ndarray)
         The fitted model and its predictions, in test row order.
-
-    Notes
-    -----
-    No leak check here. The split was checked when it was built, and
-    ``evaluate.check_out_of_sample`` re-checks the model's own recorded
-    training months before any number is produced from them. A third copy in
-    the middle asserted the same thing with a third error message.
     """
     model = factory()
     model.fit(train)
@@ -316,47 +303,40 @@ def score_predictions(
     return scored
 
 
-def evaluate_split(
+def fit_fold(
     specs: list[ModelSpec],
     dataset: Dataset,
     split: Split,
-    settings: EvaluationSettings,
     defaults: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Model], dict[str, npt.NDArray[np.float64]]]:
-    """Fit every model on one split and predict its test rows.
-
-    Deliberately does not score. The cross-validation path wants ``Scores``
-    objects and the holdout path wants the richer ``EvaluationReport``, and
-    having this function produce one of them meant the holdout was fitted here,
-    scored, and then predicted a second time through the other path.
+    """Fit every model on one fold and predict its validation rows.
 
     Parameters
     ----------
     specs : list of ModelSpec
         Models to run.
     dataset : Dataset
-        The dataset the split indexes into.
+        The dataset the split indexes into. Always the training region.
     split : Split
-        The train and test rows. Already checked for leak when it was built.
-    settings : EvaluationSettings
-        Kept in the signature because every caller has it to hand and the next
-        step always needs it.
+        The fit and validate rows. Already checked for leak when it was built.
     defaults : dict, optional
         Run-wide constructor values, handed to each model as it is built.
 
     Returns
     -------
     tuple of (dict, dict)
-        The fitted models and their predictions over the test rows, both keyed
-        by model name.
+        The fitted models and their predictions over the validation rows, both
+        keyed by model name.
     """
-    train = dataset.take(split.train_positions)
-    test = dataset.take(split.test_positions)
+    fit_rows = dataset.take(split.train_positions)
+    validate_rows = dataset.take(split.test_positions)
 
     models: dict[str, Model] = {}
     predictions: dict[str, npt.NDArray[np.float64]] = {}
     for spec in specs:
-        model, prediction = fit_and_predict(spec.factory(defaults), train, test)
+        model, prediction = fit_and_predict(
+            spec.factory(defaults), fit_rows, validate_rows
+        )
         models[spec.name] = model
         predictions[spec.name] = prediction
 
@@ -392,12 +372,12 @@ def cross_validate(
     Returns
     -------
     pandas.DataFrame
-        One row per (fold, model), with the RMSE, both R squareds and the skill
-        score. Empty when no folds were produced.
+        One row per (fold, model), with the RMSE, the honest R squared and the
+        skill score. Empty when no folds were produced.
     """
     rows: list[dict[str, Any]] = []
     for fold in folds:
-        _, predictions = evaluate_split(specs, train, fold, settings, defaults)
+        _, predictions = fit_fold(specs, train, fold, defaults)
         scored = score_predictions(
             predictions, train.take(fold.test_positions), settings
         )
@@ -410,6 +390,7 @@ def cross_validate(
                     "model": model_name,
                     "rmse": scores.rmse,
                     "mae": scores.mae,
+                    "smape": scores.smape,
                     "r2_change": scores.r2_change,
                     "skill": scores.skill,
                 }
@@ -442,6 +423,7 @@ def summarise_folds(fold_scores: pd.DataFrame) -> pd.DataFrame:
             rmse_mean=("rmse", "mean"),
             rmse_std=("rmse", "std"),
             mae_mean=("mae", "mean"),
+            smape_mean=("smape", "mean"),
             r2_change_mean=("r2_change", "mean"),
             skill_mean=("skill", "mean"),
         )
@@ -449,8 +431,8 @@ def summarise_folds(fold_scores: pd.DataFrame) -> pd.DataFrame:
     )
 
 
-def run(config: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Run the whole pipeline once and return the summary it wrote.
+def run(config: dict[str, Any] | None = None) -> dict[str, Model]:
+    """Fit every configured model on the training region and save it.
 
     Parameters
     ----------
@@ -459,8 +441,8 @@ def run(config: dict[str, Any] | None = None) -> dict[str, Any]:
 
     Returns
     -------
-    dict
-        The run summary, the same object written to the JSON file.
+    dict of str to Model
+        The fitted models, keyed by name, as they were saved.
     """
     settings = config if config is not None else load_config()
     split_settings = SplitSettings.from_config(settings)
@@ -480,9 +462,18 @@ def run(config: dict[str, Any] | None = None) -> dict[str, Any]:
     print(f"Split     : {split_settings.describe()}")
     print(f"Models    : {', '.join(spec.name for spec in specs)}")
 
-    dropped = data_block.get("drop_columns") or []
-    if dropped:
-        print(f"Dropped   : {len(dropped)} columns -- {', '.join(dropped)}")
+    frozen = settings.get("features") or []
+    if frozen:
+        print(
+            f"Features  : {len(frozen)} columns, frozen in the config's "
+            f"`features` block"
+        )
+    else:
+        print(
+            f"Features  : {len(dataset.feature_columns)} columns, derived by "
+            f"exclusion (no `features` block; run src.features_selection to "
+            f"freeze a set)"
+        )
 
     # Re-run on every run rather than trusting the config to stay correct. A
     # month whose targets simply repeat the previous month's balances is an
@@ -499,14 +490,18 @@ def run(config: dict[str, Any] | None = None) -> dict[str, Any]:
                 f"Add it to data.exclude_months, or explain why it is real."
             )
 
-    # The holdout is cut first and the training region is what everything else
-    # sees, so cross-validation cannot reach into the held-out months.
+    # The holdout is cut here and then discarded. `train` is the only dataset
+    # anything below this line sees, so nothing in this file can read a
+    # held-out month even by mistake.
     holdout = holdout_split(
         dataset, split_settings.test_months, split_settings.gap_months
     )
-    print(f"Holdout   : {holdout.summary()}")
-
     train = dataset.take(holdout.train_positions)
+    print(f"Training  : {holdout.n_train:,} rows, {len(train.months)} months, "
+          f"{train.months[0]:%Y-%m}..{train.months[-1]:%Y-%m}")
+    print(f"Held out  : {holdout.n_test:,} rows from "
+          f"{holdout.test_months[0]:%Y-%m} -- not read again in this script")
+
     folds = expanding_folds(
         train,
         n_folds=split_settings.cv_folds,
@@ -515,186 +510,79 @@ def run(config: dict[str, Any] | None = None) -> dict[str, Any]:
         min_train_months=split_settings.min_train_months,
     )
 
-    print(f"\n--- Cross-validation ({len(folds)} expanding folds inside the training region)")
+    print(
+        f"\n--- Cross-validation ({len(folds)} expanding folds inside the "
+        f"training region)"
+    )
     fold_scores = cross_validate(specs, train, folds, evaluation, defaults)
-    fold_summary = summarise_folds(fold_scores)
-    print(fold_summary.to_string(float_format=lambda value: f"{value:,.2f}"))
-
-    # The holdout, fitted and predicted exactly once. The predictions are handed
-    # to evaluate.py rather than left for it to recompute; it still re-checks
-    # that no scored month was trained on before it computes anything.
-    fitted, holdout_predictions = evaluate_split(
-        specs, dataset, holdout, evaluation, defaults
-    )
-    test = dataset.take(holdout.test_positions)
-    reports = evaluate_models(
-        fitted,
-        test,
-        anchor_column=evaluation.anchor_column,
-        reference_model=evaluation.reference_model,
-        mape_floor=evaluation.mape_floor,
-        predictions=holdout_predictions,
-    )
-
-    print("\n--- Holdout (scored once, on months no model has seen)")
-    for report in reports.values():
-        print(f"  {report.describe()}")
-
-    print(f"\n--- Side by side (sorted by {evaluation.headline_metric})")
-    table = report_table(reports, sort_by=evaluation.headline_metric)
-    print(table.to_string(float_format=lambda value: f"{value:,.3f}"))
-
-    # Where the best model is worst, which is what the findings need.
-    best_name = str(table.index[0])
-    best_report = reports[best_name]
-    print(f"\n--- {best_name}: holdout months, worst first")
-    print(
-        worst_months_table(best_report).to_string(
-            float_format=lambda value: f"{value:,.0f}"
-        )
-    )
-    print(f"\n--- {best_name}: worst users")
-    print(
-        worst_users_table(best_report).to_string(
-            float_format=lambda value: f"{value:,.0f}"
-        )
-    )
-
-    # Which columns carried each fitted model. Selection itself happens in the
-    # notebook against Pearson and Spearman, which is univariate -- it scores
-    # each column against the target one at a time, so a column that only
-    # matters alongside another ranks low. This is the check that speaks to
-    # that: gain for the booster is measured over splits the tree actually
-    # made, so a column that earns its place only in combination shows up here
-    # and nowhere in the correlation table.
-    importances: dict[str, list[dict[str, Any]]] = {}
-    for name in table.index:
-        importance = fitted[str(name)].feature_importance()
-        if importance is None:
-            continue
-        importances[str(name)] = (
-            importance.rename("importance").rename_axis("feature")
-            .reset_index().to_dict(orient="records")
-        )
-        print(f"\n--- {name}: feature importance ({importance.name}), top 12")
+    if fold_scores.empty:
         print(
-            importance.head(12).to_string(
-                float_format=lambda value: f"{value:,.4f}"
-            )
+            "  No folds were produced. Check cv_folds and min_train_months "
+            "against the number of training months."
         )
-
-    if not importances:
+    else:
+        fold_summary = summarise_folds(fold_scores)
+        print(fold_summary.to_string(float_format=lambda value: f"{value:,.2f}"))
         print(
-            "\nNo model in this run exposes feature importance; the table is "
-            "all baselines."
+            "\n  These are validation scores from inside the training region, "
+            "for choosing between models.\n  The headline comparison is "
+            "`python -m src.test`, on months no model here has seen."
         )
 
-    # What the search settled on, for the run summary and for the write-up.
-    tuning: dict[str, dict[str, Any]] = {}
-    for name, model in fitted.items():
-        chosen = getattr(model, "best_params_", None)
-        if chosen is None:
-            continue
-        tuning[name] = {
-            "best_params": chosen,
-            "search_cv_score": getattr(model, "search_cv_score_", None),
-            "best_iteration": getattr(model, "best_iteration_", None),
-            "stopping_rounds": getattr(model, "stopping_rounds_", []),
-        }
-    if tuning:
+    # The final fit: every model, on the whole training region, once.
+    print("\n--- Fitting on the full training region")
+    fitted: dict[str, Model] = {}
+    for spec in specs:
+        model = spec.factory(defaults)()
+        model.fit(train)
+        fitted[spec.name] = model
+        print(f"  {model.describe()}")
+
+    # What the search settled on. Printed rather than written to a summary
+    # file: it is also pickled with the model, so the artefact can be asked
+    # directly rather than cross-referenced against a run log.
+    tuned = {
+        name: model
+        for name, model in fitted.items()
+        if getattr(model, "best_params_", None) is not None
+    }
+    if tuned:
         print("\n--- Tuning")
-        for name, found in tuning.items():
-            print(f"  {name}: {found['best_params']}")
-            rounds = found["best_iteration"]
+        for name, model in tuned.items():
+            print(f"  {name}: {getattr(model, 'best_params_', None)}")
+            rounds = getattr(model, "best_iteration_", None)
             if rounds:
-                per_fold = found["stopping_rounds"]
                 print(
-                    f"    {rounds} rounds, the median of {per_fold} across the "
+                    f"    {rounds} rounds, the median of "
+                    f"{getattr(model, 'stopping_rounds_', [])} across the "
                     f"early-stopping folds"
                 )
 
-    # Seal the fitted models. Done after scoring so the metadata beside each
-    # artefact carries the score it actually earned on the holdout.
-    print("\n--- Sealed artefacts")
+    # Which columns carried each fitted model. Gain is measured over splits the
+    # tree actually made, so a column that earns its place only in combination
+    # with another shows up here and nowhere in a correlation table.
+    for name, model in fitted.items():
+        importance = model.feature_importance()
+        if importance is None:
+            continue
+        print(f"\n--- {name}: feature importance ({importance.name}), top 12")
+        print(importance.head(12).to_string(float_format=lambda v: f"{v:,.4f}"))
+
+    # Saved last, so nothing is written unless everything fitted. Each file is
+    # the whole model: preprocessing, fitted statistics, the months it saw and
+    # the columns it expects.
     output_dir = resolve_output_dir(settings)
-    saved: list[dict[str, Any]] = []
+    print(f"\n--- Saved to {output_dir}")
     for spec in specs:
-        path, artifact = save_model(
-            fitted[spec.name],
-            output_dir,
-            kind=spec.kind,
-            params=spec.params,
-            scores=reports[spec.name].scores.model_dump(),
-            data_summary=dataset.summary(),
-            split_summary=holdout.summary(),
-            n_training_rows=holdout.n_train,
-        )
-        saved.append({"path": str(path), "sha256": artifact.model_sha256})
-        print(f"  {path.name}  sha256 {artifact.model_sha256[:12]}")
+        path = fitted[spec.name].save(model_path(output_dir, spec.name))
+        print(f"  {path.name}")
 
-    summary: dict[str, Any] = {
-        "run_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "data": dataset.summary(),
-        # Recorded so a run's numbers can be read against the exact feature set
-        # that produced them, without going back to the config's git history.
-        "features": {
-            "used": list(dataset.feature_columns),
-            "dropped": list(dropped),
-        },
-        "split": split_settings.model_dump(),
-        "evaluation": evaluation.model_dump(),
-        "models": [spec.model_dump() for spec in specs],
-        "cross_validation": {
-            "folds": [fold.summary() for fold in folds],
-            "per_fold": fold_scores.to_dict(orient="records"),
-            "per_model": fold_summary.reset_index().to_dict(orient="records"),
-        },
-        "holdout": {
-            "split": holdout.summary(),
-            "reports": {
-                name: report.model_dump() for name, report in reports.items()
-            },
-        },
-        "best_model": best_name,
-        "headline_metric": evaluation.headline_metric,
-        "tuning": tuning,
-        "feature_importance": importances,
-        "artifacts": saved,
-    }
-
-    output_path = write_summary(summary, settings)
-    print(f"\nSummary written to {output_path}")
-    return summary
-
-
-def write_summary(summary: dict[str, Any], config: dict[str, Any]) -> Path:
-    """Write the run summary as JSON next to the saved models.
-
-    One file per run, named by timestamp, so a run never overwrites the
-    evidence of the one before it.
-
-    Parameters
-    ----------
-    summary : dict
-        The summary to write.
-    config : dict
-        Parsed config, used to locate the output directory.
-
-    Returns
-    -------
-    pathlib.Path
-        Where the file was written.
-    """
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    path = resolve_output_dir(config) / f"run_{stamp}.json"
-    # default=str so a stray Timestamp or numpy scalar is written rather than
-    # failing a run that has already done all its work.
-    path.write_text(json.dumps(summary, indent=2, default=str), encoding="utf-8")
-    return path
+    print("\nNow score them:  python -m src.test")
+    return fitted
 
 
 def main() -> None:
-    """Run the pipeline. The container's entry point.
+    """Run the training pipeline. The container's entry point.
 
     Returns
     -------

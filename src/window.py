@@ -17,6 +17,13 @@ So every split here cuts along the month axis and nothing else:
   cross-validator interface, so it can be handed to ``cross_val_score`` or a
   search object as ``cv=``.
 
+Everything here is used by the *training* side only -- ``train.py``,
+``tuning.py`` and ``features_selection.py``, all of which live entirely inside
+the training region. ``test.py`` does not import this module. It asks the saved
+model which months it was fitted on and scores everything strictly after that,
+so the boundary between train and test is a fact recorded by the fit rather
+than a calculation repeated in two places that can drift apart.
+
 Two deliberate choices worth stating, because both are the sort of thing that
 is otherwise read as an oversight:
 

@@ -37,11 +37,78 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from src.models_code.base_class import Model
 from src.data.data import Dataset
-from src.metrics import Scores, anchor_values, score, score_by_group
+from src.metrics import (
+    DEFAULT_TIER_QUANTILES,
+    Scores,
+    anchor_values,
+    score,
+    score_by_group,
+)
 
 # How many of the worst months and users a report keeps. Enough to see a
 # pattern, few enough to read in a terminal.
 WORST_N = 10
+
+# Tiers, smallest account first, for printing. "unassigned" is not listed: it
+# is appended after these when it occurs, which it only does for an entity
+# whose first month falls inside the holdout.
+TIER_ORDER: tuple[str, ...] = ("smb", "mid", "enterprise")
+
+
+class EvaluationSettings(BaseModel):
+    """The ``evaluation`` block of the config.
+
+    Lives here rather than in either entry point because both read it, and the
+    two must agree: ``train.py`` uses it to score the cross-validation folds and
+    ``test.py`` uses it to score the holdout. A copy in each would be two places
+    for the anchor column or the headline metric to drift apart, and the whole
+    point of the train/test division is that the two scripts cannot disagree
+    about how a number was produced.
+
+    Attributes
+    ----------
+    reference_model : str
+        Name of the model every skill score is measured against. Normally the
+        3-month average, since that is the bar the brief sets.
+    anchor_column : str
+        Column holding last month's balance, used by the change framing.
+    mape_floor : float
+        Rows with a smaller absolute true value are left out of the percentage
+        error.
+    headline_metric : str
+        Which column the comparison table is ranked on. Defaults to WAPE:
+        total absolute error over total absolute truth, which is scale-aware
+        without MAPE's blow-up near zero. RMSE would rank models by how well
+        they fit the largest handful of accounts, and median_ae ranks by the
+        typical account while ignoring the tail entirely.
+    tier_quantiles : tuple of float
+        The two cut points for the account-size tiers, as quantiles of each
+        entity's median absolute balance. See ``metrics.assign_tiers``.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    reference_model: str = "three_month_average"
+    anchor_column: str = "prev_1m_closing_balance_usd"
+    mape_floor: float = 1_000.0
+    headline_metric: str = "wape"
+    tier_quantiles: tuple[float, float] = DEFAULT_TIER_QUANTILES
+
+    @classmethod
+    def from_config(cls, config: dict[str, Any]) -> EvaluationSettings:
+        """Build settings from a parsed config.
+
+        Parameters
+        ----------
+        config : dict
+            Parsed config. A missing ``evaluation`` block gives defaults.
+
+        Returns
+        -------
+        EvaluationSettings
+            Validated settings.
+        """
+        return cls.model_validate(config.get("evaluation") or {})
 
 
 class OutOfSampleError(ValueError):
@@ -79,6 +146,11 @@ class EvaluationReport(BaseModel):
         Per-month errors, worst first.
     worst_users : list of dict
         Per-user errors, worst first, truncated.
+    by_tier : list of dict
+        Errors per account-size tier, smb / mid / enterprise. Empty when no
+        tier mapping was supplied. The breakdown the global metrics cannot
+        give: a headline dominated by the largest decile says nothing about
+        whether the model works for the half of accounts that are small.
     share_of_error_top_users : float
         Share of total squared error contributed by the worst users listed.
         High values mean the headline metric is describing a handful of rows.
@@ -95,6 +167,7 @@ class EvaluationReport(BaseModel):
     absolute_error_quantiles: dict[str, float] = Field(default_factory=dict)
     worst_months: list[dict[str, Any]] = Field(default_factory=list)
     worst_users: list[dict[str, Any]] = Field(default_factory=list)
+    by_tier: list[dict[str, Any]] = Field(default_factory=list)
     share_of_error_top_users: float = 0.0
 
     def describe(self) -> str:
@@ -175,6 +248,53 @@ def error_quantiles(errors: npt.NDArray[np.float64]) -> dict[str, float]:
     return {f"p{point}": float(value) for point, value in zip(wanted, values)}
 
 
+def _as_records(table: pd.DataFrame, label: str) -> list[dict[str, Any]]:
+    """Turn a ``score_by_group`` table into JSON-serialisable records.
+
+    Parameters
+    ----------
+    table : pandas.DataFrame
+        Output of ``score_by_group``, indexed by the group label.
+    label : str
+        Name the index takes as a field in each record.
+
+    Returns
+    -------
+    list of dict
+        One record per group, empty for an empty table. Keys are plain
+        strings, so the run summary writes as JSON without a custom encoder.
+    """
+    if table.empty:
+        return []
+    return [
+        {label: str(group), **{str(key): value for key, value in row.items()}}
+        for group, row in table.to_dict(orient="index").items()
+    ]
+
+
+def tier_table(report: EvaluationReport) -> pd.DataFrame:
+    """Lay one report's per-tier breakdown out for printing.
+
+    Parameters
+    ----------
+    report : EvaluationReport
+        A report built with a tier mapping.
+
+    Returns
+    -------
+    pandas.DataFrame
+        One row per tier indexed by tier name, ordered smb, mid, enterprise so
+        the table reads from smallest account to largest rather than in
+        whatever order the errors happened to rank. Empty when the report
+        carries no tiers.
+    """
+    if not report.by_tier:
+        return pd.DataFrame()
+    table = pd.DataFrame(report.by_tier).set_index("tier")
+    order = [name for name in TIER_ORDER if name in table.index]
+    return table.loc[order + [n for n in table.index if n not in order]]
+
+
 def evaluate_predictions(
     model_name: str,
     predictions: npt.NDArray[np.float64],
@@ -183,6 +303,7 @@ def evaluate_predictions(
     reference_pred: npt.NDArray[np.float64] | None = None,
     trained_through: str | None = None,
     mape_floor: float = 1_000.0,
+    tiers: pd.Series | None = None,
 ) -> EvaluationReport:
     """Build a full report from predictions that have already been made.
 
@@ -207,6 +328,10 @@ def evaluate_predictions(
     mape_floor : float, optional
         Rows below this absolute true value are left out of the percentage
         error. Default 1000.
+    tiers : pandas.Series, optional
+        Tier name indexed by entity id, from ``metrics.assign_tiers``. Must
+        have been built from training rows only. Omitted, the tier breakdown
+        is simply empty.
 
     Returns
     -------
@@ -228,6 +353,14 @@ def evaluate_predictions(
     by_month = score_by_group(truth, predictions, test.times, label="month")
     by_user = score_by_group(truth, predictions, test.entities, label="user")
 
+    # Per tier. An entity with no tier -- one whose first month falls in the
+    # holdout, so it was not present when the tiers were cut -- is labelled
+    # rather than dropped, so the row counts still add up to the rows scored.
+    by_tier = pd.DataFrame()
+    if tiers is not None:
+        labels = test.entities.map(tiers).fillna("unassigned")
+        by_tier = score_by_group(truth, predictions, labels, label="tier")
+
     # How concentrated the error is. When a handful of users carry most of the
     # squared error, the headline RMSE is a statement about those users and not
     # about the model, and the report should say so rather than leave it to be
@@ -247,6 +380,7 @@ def evaluate_predictions(
         n_rows=test.n_rows,
         scores=scores,
         bias=float(errors.mean()),
+        by_tier=_as_records(by_tier, "tier"),
         absolute_error_quantiles=error_quantiles(errors),
         worst_months=[
             {"month": f"{month:%Y-%m}", **row}
@@ -266,6 +400,7 @@ def evaluate_model(
     anchor_column: str,
     reference_pred: npt.NDArray[np.float64] | None = None,
     mape_floor: float = 1_000.0,
+    tiers: pd.Series | None = None,
 ) -> tuple[EvaluationReport, npt.NDArray[np.float64]]:
     """Score a fitted model on held-out rows.
 
@@ -282,6 +417,8 @@ def evaluate_model(
     mape_floor : float, optional
         Rows below this absolute true value are left out of the percentage
         error. Default 1000.
+    tiers : pandas.Series, optional
+        Tier name per entity id, for the per-tier breakdown.
 
     Returns
     -------
@@ -308,6 +445,7 @@ def evaluate_model(
         reference_pred=reference_pred,
         trained_through=f"{through:%Y-%m}" if through is not None else None,
         mape_floor=mape_floor,
+        tiers=tiers,
     )
     return report, predictions
 
@@ -319,6 +457,7 @@ def evaluate_models(
     reference_model: str | None = None,
     mape_floor: float = 1_000.0,
     predictions: dict[str, npt.NDArray[np.float64]] | None = None,
+    tiers: pd.Series | None = None,
 ) -> dict[str, EvaluationReport]:
     """Score several fitted models on the same held-out rows.
 
@@ -343,6 +482,8 @@ def evaluate_models(
         once and passes the result here rather than having every model predict
         a second time. A model missing from the dict is predicted normally, so
         a partial dict is safe.
+    tiers : pandas.Series, optional
+        Tier name per entity id, passed through to every report.
 
     Returns
     -------
@@ -382,11 +523,17 @@ def evaluate_models(
                 reference_pred=against,
                 trained_through=f"{through:%Y-%m}" if through is not None else None,
                 mape_floor=mape_floor,
+                tiers=tiers,
             )
             continue
 
         report, _ = evaluate_model(
-            model, test, anchor_column, reference_pred=against, mape_floor=mape_floor
+            model,
+            test,
+            anchor_column,
+            reference_pred=against,
+            mape_floor=mape_floor,
+            tiers=tiers,
         )
         reports[name] = report
     return reports
@@ -416,6 +563,13 @@ def report_table(reports: dict[str, EvaluationReport], sort_by: str = "median_ae
             "rmse": report.scores.rmse,
             "mae": report.scores.mae,
             "median_ae": report.scores.median_ae,
+            # Total absolute error over total absolute truth. The default
+            # headline: scale-aware without MAPE's blow-up near zero. Absent
+            # from this table until now, which quietly sent the configured
+            # `headline_metric: wape` down the fallback branch below and ranked
+            # every comparison by median_ae instead.
+            "wape": report.scores.wape,
+            "smape": report.scores.smape,
             "p90_ae": report.absolute_error_quantiles.get("p90", float("nan")),
             "bias": report.bias,
             "r2_level": report.scores.r2_level,

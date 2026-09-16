@@ -33,6 +33,7 @@ from sqlalchemy.engine import Engine
 
 from src.config.config import load_config
 from src.data.db_link import load_dataframe
+from src.features import add_derived_features
 
 # Pandas period alias for a calendar month. Month values are normalised through
 # it to the first of the month: the feature table already stores them that way,
@@ -256,13 +257,30 @@ def resolve_feature_columns(
     id_column: str,
     time_column: str,
     drop_columns: tuple[str, ...] = (),
+    keep_columns: tuple[str, ...] = (),
 ) -> tuple[str, ...]:
-    """Return the model feature columns, derived by exclusion.
+    """Return the model feature columns, from an explicit list or by exclusion.
 
-    A feature is any column that is not the target, not the entity id, not the
-    time column and not explicitly dropped. Derived rather than listed, so a
-    column added to the feature table reaches the model without a matching edit
-    here, which is the usual failure mode of a hardcoded list.
+    Two modes, and which one is in force is a deliberate decision recorded in
+    the config.
+
+    **Explicit** -- ``keep_columns`` names the features. This is what a run uses
+    once ``features_selection.py`` has been run and its answer pasted into the
+    ``features`` block: the set is then frozen, visible in a git diff, and
+    identical between two runs over the same data. Selection is an occasional,
+    committed decision; training reads the decision rather than retaking it.
+
+    **By exclusion** -- no ``keep_columns``, so a feature is any column that is
+    not the target, not the entity id, not the time column and not explicitly
+    dropped. This is the mode to be in while the feature table is still being
+    iterated on, since a new column reaches the model without a matching edit
+    here. It is also the mode ``features_selection.py`` itself runs in: it has
+    to see every candidate in order to rank them.
+
+    Note what neither mode does: remove a column from the frame. A column that
+    is not a feature is still there to be read by name. That is what lets the
+    baseline average the raw balance lags, and the anchor arithmetic rebuild a
+    dollar prediction, while no model is allowed to *learn* from account size.
 
     Parameters
     ----------
@@ -276,19 +294,53 @@ def resolve_feature_columns(
         Name of the month column.
     drop_columns : tuple of str, optional
         Columns to exclude by hand, for example one half of a pair that says
-        the same thing twice. Default is no exclusions.
+        the same thing twice. Default is no exclusions. Ignored when
+        ``keep_columns`` is given, since an explicit list already says what is
+        in.
+    keep_columns : tuple of str, optional
+        The exact feature set, in this order. Default empty, which selects the
+        exclusion mode above.
 
     Returns
     -------
     tuple of str
-        Feature column names, in the order they appear in the frame.
+        Feature column names. In the given order when explicit, otherwise in
+        the order they appear in the frame.
 
     Raises
     ------
+    KeyError
+        If ``keep_columns`` names a column the frame does not have. Raised
+        rather than skipped: a frozen feature set that silently shrinks because
+        a column was renamed upstream would change every number in the run
+        without changing anything visible in the config.
     ValueError
-        If no feature columns survive the exclusions.
+        If no feature columns survive the exclusions, or ``keep_columns``
+        names one of the three reserved roles.
     """
-    excluded = {target_column, id_column, time_column, *drop_columns}
+    reserved = {target_column, id_column, time_column}
+
+    if keep_columns:
+        wanted = tuple(str(name) for name in keep_columns)
+
+        clashes = [name for name in wanted if name in reserved]
+        if clashes:
+            raise ValueError(
+                f"features lists {clashes}, which are the target, id or time "
+                f"column and can never be model inputs"
+            )
+
+        missing = [name for name in wanted if name not in frame.columns]
+        if missing:
+            raise KeyError(
+                f"The features block names {len(missing)} column(s) that are "
+                f"not in the data: {missing}. Either the feature table changed "
+                f"or the block is stale -- re-run "
+                f"`python -m src.features_selection`."
+            )
+        return wanted
+
+    excluded = {*reserved, *drop_columns}
     features = tuple(str(column) for column in frame.columns if column not in excluded)
     if not features:
         raise ValueError(
@@ -486,6 +538,10 @@ def build_dataset(
     id_column = str(data_settings["id_column"])
     time_column = str(data_settings["time_column"])
     drop_columns = tuple(str(name) for name in data_settings.get("drop_columns") or ())
+    # The frozen feature set, top level in the config rather than under `data`
+    # because it is an output of feature selection rather than a property of
+    # the source table. Empty or absent means "derive by exclusion".
+    keep_columns = tuple(str(name) for name in (settings.get("features") or ()))
     exclude_months = tuple(
         pd.Timestamp(str(month)).to_period(MONTH_PERIOD).to_timestamp()
         for month in data_settings.get("exclude_months") or ()
@@ -520,12 +576,25 @@ def build_dataset(
     # than defending against it in each of them.
     ordered = typed.sort_values([id_column, time_column]).reset_index(drop=True)
 
+    # Ratios, momentum, spending shares and calendar flags, built from the
+    # columns already present. This is where the size bias is taken out: the
+    # table arrives as mostly absolute dollar amounts, which tell a model how
+    # big an account is rather than what it is doing.
+    #
+    # Added here, before the feature list is resolved, so a derived column is an
+    # ordinary column from that point on -- picked up automatically, excludable
+    # through drop_columns, visible to feature selection, and saved with the
+    # model. Every function in src/features.py is row-wise over already-lagged
+    # inputs, so this cannot introduce a look-ahead; see the module docstring.
+    ordered = add_derived_features(ordered, time_column=time_column)
+
     features = resolve_feature_columns(
         ordered,
         target_column=target_column,
         id_column=id_column,
         time_column=time_column,
         drop_columns=drop_columns,
+        keep_columns=keep_columns,
     )
     return Dataset(
         frame=ordered,

@@ -20,6 +20,12 @@ scaler on rows a model should not have seen. It also means the saved model is
 the whole transformation, and prediction time cannot drift from training time.
 The baseline owns nothing, because it needs nothing.
 
+**A model saves itself.** ``save`` and ``load`` live here rather than in a
+separate persistence module, because the thing worth persisting is the whole
+object: preprocessing, fitted statistics, the months it was trained on, and the
+columns it expects. Splitting that across a pickle and a sidecar file only
+creates the question of whether the two still describe each other.
+
 The public ``fit`` and ``predict`` are deliberately not the methods a subclass
 overrides. They run the guard rails (is it fitted, are the columns present, is
 the output the right shape and finite) and then call ``_fit`` and ``_predict``,
@@ -30,21 +36,93 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any, ClassVar, Literal
 
+import joblib
 import numpy as np
 import numpy.typing as npt
 import pandas as pd
 
 from src.data.data import Dataset
+from src.models_code.entity_scaler import (
+    DEFAULT_FLOOR_FRACTION,
+    DEFAULT_MIN_ROWS,
+    EntityScaler,
+)
 
-# What a regression is asked to predict. ``level`` fits the closing balance
-# itself; ``change`` fits the movement from last month and adds the anchor back
-# at prediction time. On this panel the level is almost entirely last month's
-# balance, so a model fitted on the level spends its capacity rediscovering
-# that. Defined here rather than in one of the model modules, so the two do not
-# have to import a two-value alias from each other.
-TargetMode = Literal["level", "change"]
+# What a regression is asked to predict. Every mode returns predictions on the
+# balance scale, so all four are scored by identical metric code and are
+# directly comparable in one results table. Defined here rather than in one of
+# the model modules, so the two do not have to import the alias from each other.
+#
+#   level              the closing balance itself. On this panel the level is
+#                      almost entirely last month's balance, so a model fitted
+#                      on it spends its capacity rediscovering that.
+#   change             the movement from last month, in dollars. Honest about
+#                      what is being predicted, but a dollar is not a dollar
+#                      here: the panel spans accounts whose ordinary monthly
+#                      movement differs by three orders of magnitude, so a
+#                      squared-error fit on this target is fitted almost
+#                      entirely to the largest few accounts.
+#   scaled_change      the movement divided by that user's own typical movement
+#                      (see entity_scaler). Scale-free, defined on every row
+#                      including zero and negative balances, and exactly
+#                      invertible. The intended default.
+#   signed_log_change  the movement in signed-log space. The log framing, made
+#                      usable on a target that goes negative. Compresses the
+#                      extremes harder than scaling does, at the cost of an
+#                      inverse that is sensitive near zero.
+TargetMode = Literal["level", "change", "scaled_change", "signed_log_change"]
+
+# Modes whose training target is a movement rather than a balance. Used in
+# several places to decide whether the anchor is needed at all.
+CHANGE_MODES: frozenset[str] = frozenset(
+    {"change", "scaled_change", "signed_log_change"}
+)
+
+
+def signed_log(values: npt.NDArray[np.float64]) -> npt.NDArray[np.float64]:
+    """Return ``sign(x) * log1p(|x|)``, a log that is defined for every real x.
+
+    Plain ``log1p`` is undefined at or below -1, and closing balances on this
+    panel reach zero and go negative, so the textbook
+    ``log(1 + spend_t) - log(1 + spend_t-1)`` cannot be used as written. This
+    is the standard substitute: it is continuous, strictly increasing, odd
+    about zero, and behaves like the identity for small values and like a
+    logarithm for large ones -- which is the compression the log was wanted for
+    in the first place.
+
+    Parameters
+    ----------
+    values : numpy.ndarray of float
+        Any real values, including negatives and zero.
+
+    Returns
+    -------
+    numpy.ndarray of float
+        The signed log. NaN in, NaN out.
+    """
+    array = np.asarray(values, dtype="float64")
+    return np.sign(array) * np.log1p(np.abs(array))
+
+
+def inverse_signed_log(values: npt.NDArray[np.float64]) -> npt.NDArray[np.float64]:
+    """Invert :func:`signed_log`.
+
+    Parameters
+    ----------
+    values : numpy.ndarray of float
+        Values on the signed-log axis.
+
+    Returns
+    -------
+    numpy.ndarray of float
+        Values back on the original axis. Exact to floating point, so a
+        round trip through both functions returns the input.
+    """
+    array = np.asarray(values, dtype="float64")
+    return np.sign(array) * np.expm1(np.abs(array))
 
 
 class NotFittedError(RuntimeError):
@@ -294,6 +372,79 @@ class Model(ABC):
             )
         return predictions
 
+    def save(self, path: str | Path) -> Path:
+        """Write the fitted model to a single file.
+
+        The whole object is pickled, not just the estimator inside it. Because
+        each model owns its own preprocessing -- the imputer, the per-entity
+        scaler, the anchor arithmetic that turns a predicted movement back into
+        a balance -- this one file is the entire transformation from a raw
+        feature row to a prediction. There is no second step to reconstruct,
+        and so no way for prediction time to drift away from training time.
+
+        It also carries what the model was trained on. ``trained_through`` and
+        ``feature_columns`` are attributes of the pickled object, which is what
+        lets ``test.py`` derive the test region from the model itself instead
+        of recomputing a cut-off from the config and hoping the two agree.
+
+        Parameters
+        ----------
+        path : str or pathlib.Path
+            Destination file. Parent directories are created if absent.
+
+        Returns
+        -------
+        pathlib.Path
+            Where it was written.
+
+        Raises
+        ------
+        NotFittedError
+            If the model has not been fitted. An unfitted model on disk is a
+            trap: it loads without complaint and refuses at predict time, three
+            steps from the thing that actually went wrong.
+        """
+        if not self._is_fitted:
+            raise NotFittedError(f"{self.name}: fit() before save()")
+        destination = Path(path)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        joblib.dump(self, destination)
+        return destination
+
+    @classmethod
+    def load(cls, path: str | Path) -> Model:
+        """Read a fitted model back from a file written by ``save``.
+
+        Parameters
+        ----------
+        path : str or pathlib.Path
+            The file to read.
+
+        Returns
+        -------
+        Model
+            The fitted model, ready to predict.
+
+        Raises
+        ------
+        FileNotFoundError
+            If the file is absent, with the path named, since the usual cause
+            is that ``train.py`` has not been run yet.
+        TypeError
+            If the file does not hold a model of this project.
+        """
+        source = Path(path)
+        if not source.exists():
+            raise FileNotFoundError(
+                f"No saved model at {source}. Run `python -m src.train` first."
+            )
+        loaded = joblib.load(source)
+        if not isinstance(loaded, Model):
+            raise TypeError(
+                f"{source} holds a {type(loaded).__name__}, not a Model"
+            )
+        return loaded
+
     def feature_importance(self) -> pd.Series | None:
         """Return per-feature importance, when the model family has one.
 
@@ -385,21 +536,30 @@ class AnchoredModel(Model):
     def __init__(
         self,
         name: str,
-        target_mode: TargetMode = "change",
+        target_mode: TargetMode = "scaled_change",
         anchor_column: str = "prev_1m_closing_balance_usd",
         search: dict[str, Any] | None = None,
+        scale_floor_fraction: float = DEFAULT_FLOOR_FRACTION,
+        scale_min_rows: int = DEFAULT_MIN_ROWS,
     ) -> None:
         super().__init__(name)
-        if target_mode not in ("level", "change"):
+        allowed = ("level", *sorted(CHANGE_MODES))
+        if target_mode not in allowed:
             raise ValueError(
-                f"Unknown target_mode {target_mode!r}; expected level or change"
+                f"Unknown target_mode {target_mode!r}; expected one of {allowed}"
             )
         self.target_mode: TargetMode = target_mode
         self.anchor_column = anchor_column
         self.search = search or {}
+        self.scale_floor_fraction = float(scale_floor_fraction)
+        self.scale_min_rows = int(scale_min_rows)
 
         self.best_params_: dict[str, Any] | None = None
         self.search_cv_score_: float | None = None
+
+        # Fitted in _training_target, which is reached only from _fit, so this
+        # can never see a row the model was not handed for training.
+        self.scaler_: EntityScaler | None = None
 
     @property
     def required_columns(self) -> tuple[str, ...]:
@@ -415,7 +575,7 @@ class AnchoredModel(Model):
             Feature columns, plus the anchor column in change mode.
         """
         if (
-            self.target_mode == "change"
+            self.target_mode in CHANGE_MODES
             and self.anchor_column not in self._feature_columns
         ):
             return (*self._feature_columns, self.anchor_column)
@@ -432,24 +592,52 @@ class AnchoredModel(Model):
         Returns
         -------
         pandas.Series
-            The closing balance in level mode, or the movement from last month
-            in change mode. A user's first month has no anchor, so its movement
-            is NaN; ``_fit`` drops those rows rather than inventing an anchor,
-            which would invent a movement to learn from.
+            The closing balance in level mode; otherwise the movement from
+            last month, on the axis this mode fits. A user's first month has no
+            anchor, so its movement is NaN; ``_fit`` drops those rows rather
+            than inventing an anchor, which would invent a movement to learn
+            from.
 
         Raises
         ------
         KeyError
-            If change mode is configured and the anchor column is absent.
+            If a change mode is configured and the anchor column is absent.
+
+        Notes
+        -----
+        ``scaled_change`` fits the per-entity scaler here, as a side effect.
+        That is deliberate and safe: this method is called from ``_fit`` and
+        nowhere else, so the scaler only ever sees training rows, and every
+        cross-validation fold gets a freshly built model and therefore a
+        freshly fitted scaler. Fitting it in ``build_dataset`` instead would
+        estimate every user's scale over the whole panel, holdout included.
         """
         if self.target_mode == "level":
             return dataset.target
         if self.anchor_column not in dataset.frame.columns:
             raise KeyError(
-                f"{self.name}: change mode needs {self.anchor_column!r}, which is "
-                f"not in the data"
+                f"{self.name}: {self.target_mode} needs {self.anchor_column!r}, "
+                f"which is not in the data"
             )
-        return dataset.target - dataset.frame[self.anchor_column]
+
+        anchor = dataset.frame[self.anchor_column]
+        if self.target_mode == "signed_log_change":
+            return pd.Series(
+                signed_log(dataset.target.to_numpy(dtype="float64"))
+                - signed_log(anchor.to_numpy(dtype="float64")),
+                index=dataset.target.index,
+            )
+
+        change = dataset.target - anchor
+        if self.target_mode == "change":
+            return change
+
+        entities = dataset.frame[dataset.id_column]
+        self.scaler_ = EntityScaler(
+            floor_fraction=self.scale_floor_fraction,
+            min_rows=self.scale_min_rows,
+        ).fit(entities, change)
+        return pd.Series(self.scaler_.transform(entities, change), index=change.index)
 
     def _restore_level(
         self, dataset: Dataset, predicted: npt.NDArray[np.float64]
@@ -467,14 +655,40 @@ class AnchoredModel(Model):
         Returns
         -------
         numpy.ndarray of float
-            Predictions on the balance scale in both modes. A row with no
+            Predictions on the balance scale in every mode. A row with no
             anchor keeps the raw prediction rather than becoming NaN, which
             would fail the finiteness check in ``predict``.
+
+        Raises
+        ------
+        RuntimeError
+            If scaled mode reaches prediction with no fitted scaler, which
+            would mean ``_predict`` ran without ``_fit``.
         """
         if self.target_mode == "level":
             return predicted
+
         anchor = dataset.frame[self.anchor_column].to_numpy(dtype="float64")
-        return np.where(np.isfinite(anchor), anchor + predicted, predicted)
+
+        if self.target_mode == "signed_log_change":
+            # Reconstructed in log space and inverted once, rather than
+            # inverting the movement and adding it: the sum is the quantity the
+            # estimator was actually fitted to predict.
+            level = inverse_signed_log(signed_log(anchor) + predicted)
+            return np.where(np.isfinite(anchor), level, predicted)
+
+        if self.target_mode == "scaled_change":
+            if self.scaler_ is None:
+                raise RuntimeError(
+                    f"{self.name}: scaled_change predicted before the scaler was fitted"
+                )
+            movement = self.scaler_.inverse_transform(
+                dataset.frame[dataset.id_column], predicted
+            )
+        else:
+            movement = predicted
+
+        return np.where(np.isfinite(anchor), anchor + movement, movement)
 
     def _usable_rows(self, target: pd.Series) -> npt.NDArray[np.bool_]:
         """Return the mask of rows with a target the estimator can learn from.

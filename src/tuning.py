@@ -39,7 +39,7 @@ import pandas as pd
 from scipy.stats import loguniform, uniform
 from sklearn.model_selection import RandomizedSearchCV
 
-from src.splitting import MonthlyExpandingSplit
+from src.window import MonthlyExpandingSplit
 
 # Enough draws to cover six axes without the search costing more than the run it
 # is meant to improve. Overridden per model by `search.n_iter`.

@@ -21,33 +21,90 @@ data:
   # Every entry is justified by a measurement taken over all 6,300 rows.
   # ---------------------------------------------------------------------------
   drop_columns:
+    # -------------------------------------------------------------------------
+    # THE SIZE FILTER.
+    #
+    # Everything in this first group is an absolute dollar amount, and that is
+    # the whole reason it is here. A column measured in dollars tells a model
+    # how large an account is, and account size is overwhelmingly the most
+    # predictive thing in this table -- predictive of the balance level, which
+    # is a question nobody needed a model for, since last month's balance
+    # already answers it (r2_level 0.881 for a model with r2_change of -0.0002).
+    # What is left to predict is the movement, and the movement is behavioural.
+    #
+    # Each one is dropped because src/features.py now derives the same
+    # information as a ratio, which means the same thing on a 5,000 USD account
+    # and a 5,000,000 USD one. The replacement is named next to each.
+    #
+    # prev_1m_closing_balance_usd is dropped as a FEATURE but stays in the
+    # frame: it is the anchor, and AnchoredModel.required_columns pulls it in
+    # regardless so the movement can be added back to it at prediction time.
+    # The model no longer sees account size; the arithmetic that rebuilds the
+    # dollar answer still does.
+    - prev_1m_closing_balance_usd       # -> ratio_balance_to_roll3 (and the anchor)
+    - prev_2m_closing_balance_usd       # -> growth_1m
+    - prev_3m_closing_balance_usd       # -> growth_3m
+    - roll3_std_closing_balance_usd     # -> cv_balance_roll3 (same number over its own mean)
+    - delta_prev_1m_2m_closing_balance_usd  # -> growth_1m, the same difference as a rate
+    - prev_1m_total_credited_usd        # -> ratio_credited_to_debited
+    - prev_1m_total_debited_usd         # -> ratio_credited_to_debited, avg_debit_per_txn
+    - prev_1m_net_flow_usd              # -> net_flow_to_balance
+    - roll3_mean_net_flow_usd           # -> ratio_net_flow_to_roll3
+
+    # The seven category spends, each now carried as a share of the month's
+    # total (share_spend_*) plus spend_to_balance for the overall level. The
+    # shares hold the spending MIX, which is the behaviour; the dollar columns
+    # held mix and size together and size dominated.
+    - prev_1m_spend_groceries_usd
+    - prev_1m_spend_dining_usd
+    - prev_1m_spend_retail_usd
+    - prev_1m_spend_cash_atm_usd
+    - prev_1m_spend_transport_usd
+    - prev_1m_spend_bills_usd
+    - prev_1m_spend_other_usd
+
+    # -------------------------------------------------------------------------
     # Exactly reconstructable from columns that stay -- dropping loses nothing.
+    # These predate the size filter and were each justified by a measurement
+    # over all 6,300 rows.
+    # -------------------------------------------------------------------------
+    - month
+
+    # -------------------------------------------------------------------------
+    # DROPPED BY HAND, not by a measurement. These are computed by
+    # src/features.py and then excluded here rather than deleted from that
+    # module, so the decision is one reversible config line and the derivation
+    # stays available if it is wanted back.
+    # -------------------------------------------------------------------------
+    - acceleration_1m_vs_3m   # growth_1m and growth_3m are both kept; a booster
+                              # can form the difference itself if it pays
+    - month_sin               # is_q4 / is_november / is_december / is_quarter_end
+    - month_cos               # already name the periods that behave differently
+    - txns_per_merchant       # repeat rate; a hypothesis, not a measurement
+    - is_november             # only ~3 training observations each: a flag that
+    - is_december             # thin memorises dates rather than learning a season
+    - is_quarter_end          # cut too; is_q4 is the only calendar feature left
     - prev_1m_total_spend_usd          # == sum of the 7 prev_1m_spend_*_usd    (max diff 2.3e-10)
     - roll3_mean_closing_balance_usd   # == mean of the 3 prev_Nm_closing_balance lags (3.3e-05)
-
-    # Near-duplicates of their own 1-month lag. Redundant in practice, not
-    # exact: there are no prev_2m/prev_3m credited or debited columns, so these
-    # are the only 3-month view of flow.
     - roll3_mean_total_credited_usd    # r=0.956 / rho=0.874 vs prev_1m_total_credited_usd
     - roll3_mean_total_debited_usd     # r=0.792 / rho=0.899 vs prev_1m_total_debited_usd
 
-    # MEASURED, NOT YET ACTED ON. With the four drops above the feature matrix
-    # is still rank 19 of 21: two exact identities survive, both verified to
-    # 1e-10 over every row.
+    # -------------------------------------------------------------------------
+    # What deliberately STAYS, and why it is not a size proxy:
     #
-    #   delta_prev_1m_2m_closing_balance_usd = prev_1m_closing_balance_usd
-    #                                        - prev_2m_closing_balance_usd
-    #   prev_1m_net_flow_usd = prev_1m_total_credited_usd
-    #                        - prev_1m_total_debited_usd
-    #
-    # Both are exactly reconstructable, so uncommenting these two costs nothing
-    # and takes the table to 19 features at full rank 19. Until then
-    # ridge_change has no unique solution and its individual coefficients should
-    # not be read one by one. A tree is unaffected either way: it cannot cheaply
-    # build a difference of two columns, so the derived column may be carrying
-    # real signal for XGBoost.
-    # - delta_prev_1m_2m_closing_balance_usd
-    # - prev_1m_net_flow_usd
+    #   prev_1m_txn_count, prev_1m_distinct_merchants, accounts_held
+    #       Counts, not dollars. A hundred transactions is a hundred
+    #       transactions whatever they were worth, and frequency tends to move
+    #       before value does -- an account winding down transacts less before
+    #       its balance shows it.
+    #   avg_debit_per_txn
+    #       A dollar amount, but a per-event one: it separates "spending more
+    #       often" from "spending bigger", which the debit total merged. Watch
+    #       this one in selection -- it is the likeliest surviving size proxy,
+    #       and is exactly what stage 3's stability check exists to catch.
+    #   month_of_year, days_in_month
+    #       Calendar, alongside the explicit flags in src/features.py.
+    # -------------------------------------------------------------------------
 
   # Months excluded from the panel entirely.
   #
@@ -68,7 +125,7 @@ split:
   # There is deliberately no test_size. A random fraction of the rows would put
   # a user's later months in train and their earlier months in test, which lets
   # the model see the future. Every split cuts along the month axis instead --
-  # see src/splitting.py.
+  # see src/window.py.
   #
   # 42 usable months, so 34 train / 8 test is 81/19: the closest clean landing
   # on 80/20 (33/9 would be 78.6/21.4).
@@ -92,6 +149,200 @@ split:
   # earliest fold gets 19 months, so this is a guard rather than a constraint.
   min_train_months: 6
 
+# =============================================================================
+# THE FEATURE SET THE MODELS ARE FITTED ON.
+#
+# Empty means "derive by exclusion": every column that is not the target, the
+# id, the time column or a `data.drop_columns` entry becomes a model input.
+# That is the right mode while the feature table is still being iterated on,
+# because a new column reaches the model without an edit here.
+#
+# Fill it in and the list is frozen. That is the mode to be in once
+# `python -m src.features_selection` has been run and its answer read: the set
+# then sits in git history, and two runs over the same data use the same
+# columns.
+#
+# Why this is not re-derived on every training run:
+#
+#   - reproducibility. Same data, same seed, a wandering feature set, and no
+#     way to tell whether a score moved because of a parameter or because the
+#     columns changed underneath it.
+#   - fairness. The set is chosen by cross-validated score. Re-choosing it each
+#     run hands the booster extra attempts to fit the folds that the baseline
+#     and the linear model never got, and the leaderboard stops meaning
+#     anything.
+#   - cost. Selection is the slow part. Training should not pay for it.
+#
+# Who reads this block:
+#
+#   ridge / xgboost   fitted on exactly these columns, plus the anchor, which
+#                     AnchoredModel pulls in regardless so a predicted movement
+#                     can be turned back into a dollar balance.
+#   lag_average       ignores it entirely. The baseline averages the three raw
+#                     balance lags named in src/models_code/baseline.py and
+#                     nothing else. Give it features and it stops being a
+#                     floor and becomes a third competitor, and then there is
+#                     nothing left to measure the other two against.
+#
+# A name here that is not in the data fails the run rather than being skipped:
+# a frozen set that silently shrinks would change every number without changing
+# anything visible in this file.
+# =============================================================================
+features: []
+
+feature_selection:
+  # Read by src/features_selection.py, run separately from training:
+  #
+  #     python -m src.features_selection
+  #
+  # It never edits this file. It prints the chosen set as a `features:` block
+  # to paste in below, so narrowing the feature table stays a reviewed edit
+  # with the measurement that justified it sitting next to it.
+  #
+  # It also ignores any existing `features:` block and re-ranks every candidate
+  # column, so a feature dropped by one run can be chosen again by the next.
+  # Otherwise selection would be a ratchet that only ever narrows.
+  #
+  # Four stages, in this order, all of them on the training months only:
+  #
+  #   1  Redundancy       cluster near-duplicate columns, keep one per cluster
+  #   2  Temporal CV      rank by gain, sweep for the smallest set that holds
+  #   3  OOF stability    permutation importance on the VALIDATION folds
+  #   4  Noise test       re-run 1-3 on a shuffled target, expect nothing
+  #
+  # Stage 4 is the one that can invalidate the other three. Read it first.
+
+  # Which entry in `models` below the gain is read from. The set is chosen on
+  # the same booster that will use it -- a ranking taken from a differently
+  # configured model is a ranking for a different model.
+  model: xgboost_scaled
+
+  # Stage 1. Pairs at or above this under either Pearson or Spearman are
+  # treated as the same measurement, grouped transitively, and all but one
+  # member of each group is dropped. The survivor is the member with the
+  # highest Spearman against the MOVEMENT -- rank correlation because Pearson
+  # here can be set by a handful of large balances, and against the movement
+  # because the level is what all of them already predict.
+  #
+  # This used to only print its findings and drop nothing, on the argument that
+  # gain can split the credit between duplicates. It can -- that is the
+  # problem. Two copies of a real signal each land mid-table and neither looks
+  # decisive, so a genuine feature can rank below a mediocre one for the sole
+  # reason that it is represented twice.
+  redundancy_threshold: 0.95
+
+  # Stage 2, the parsimony rule. Candidates are the top k features by gain for
+  # every k; the smallest k whose cross-validated score is still within this
+  # fraction of the full-feature model wins. 0.02 is the loose end of the 1-2%
+  # band -- tighten to 0.01 for a final run.
+  tolerance: 0.02
+
+  # Which score the tolerance applies to. r2_change, chosen on a full sweep
+  # rather than on principle -- mae was the obvious candidate and it is the
+  # wrong one here, measurably:
+  #
+  #   metric      range over the whole 1..n sweep    k chosen at 2%
+  #   mae         8,610 .. 8,983      (4.3%)          2
+  #   rmse       25,253 .. 26,333     (4.3%)          3
+  #   smape        34.6 .. 36.2       (4.5%)          1
+  #   r2_change   0.013 .. 0.115      (9x)            n
+  #
+  # The dollar metrics barely move across the entire sweep, so a 2% band on one
+  # of them is wider than the whole signal and the rule degenerates into
+  # "whatever is smallest". Only r2_change has the dynamic range for the band
+  # to discriminate. Both are reported for every candidate regardless. Also
+  # accepts rmse and smape.
+  tolerance_metric: r2_change
+
+  # THE GATE, and the reason the noise test is a test at all.
+  #
+  # The tolerance above is purely relative: it returns the smallest k within
+  # 2% of the full set. If the full set is worthless then every k is equally
+  # worthless, every k passes, and k=1 comes back looking like a finding. The
+  # previous version of this module had exactly that hole -- it could not
+  # return an empty set under any circumstances.
+  #
+  # So before any k is considered, the full-feature model must clear this much
+  # cross-validated r2_change. Zero is a real threshold for that metric and not
+  # an arbitrary one: r2_change = 0 is exactly the accuracy of predicting that
+  # the balance does not move, which needs no features and no model.
+  min_signal: 0.01
+
+  # Stage 3. A feature is kept only if its permutation importance, measured on
+  # each fold's HELD-OUT months rather than on the training rows, is positive
+  # on average and varies across folds by no more than this coefficient of
+  # variation.
+  #
+  # Gain is a training-data statistic, and a column that memorises noise scores
+  # very well on it. The spread across folds is what catches the rest: a
+  # feature that is decisive in one quarter and irrelevant the next is fitted
+  # to that quarter. 1.5 allows the importance to vary by half again its own
+  # mean, which on five folds of three months is loose enough to survive
+  # ordinary quarterly variation.
+  #
+  # KNOWN BIAS, measured on the first run of this stage: it is unfair to yearly
+  # seasonality. is_december ranked second of thirty on gain and was dropped
+  # here for being positive in only one fold of five -- which is not evidence
+  # that December does not matter, it is arithmetic. The folds are three months
+  # each, so at most one or two of them contain a December at all, and a
+  # feature that is inert in the other four cannot produce a stable importance
+  # however real the effect is.
+  #
+  # So a calendar flag failing this stage should be read as "these folds cannot
+  # measure it" rather than "it is noise". Judge seasonal features on the gain
+  # ranking and on a full-year holdout instead, and put them back by hand.
+  stability_max_cv: 1.5
+
+  # Shuffles per feature per fold in stage 3. Five is enough to average out the
+  # shuffle itself without making the stage the slowest thing in the run.
+  permutation_repeats: 5
+
+evaluation:
+  # This block did not exist. Every value below was already in force as a
+  # pydantic default in src/train.py, which meant the choices that decide which
+  # model wins were invisible to anyone reading the config -- and one of them,
+  # the headline metric, was wrong. Written out so they are reviewed settings
+  # rather than accidents.
+
+  # The bar. Every skill score is measured against it, and it is never scored
+  # against itself.
+  reference_model: three_month_average
+
+  # Last month's balance. Read by the change-mode models to reconstruct a level
+  # from a movement, and by the metrics to compute r2_change.
+  anchor_column: prev_1m_closing_balance_usd
+
+  # Rows below this absolute true balance are left out of MAPE. MAPE divides by
+  # each row's own truth, and these balances pass through zero, so without a
+  # floor a single near-zero row produces a percentage in the thousands. Kept
+  # for continuity and always reported next to its coverage; wape below is the
+  # number to actually read.
+  mape_floor: 1000.0
+
+  # What the comparison table is ranked on.
+  #
+  # Was median_ae, by default rather than by decision. Median absolute error
+  # describes the typical account and is blind to the tail -- which is half the
+  # problem on this panel, where the top ten users held most of the squared
+  # error. RMSE is the opposite failure: it ranks models by how well they fit
+  # those same few accounts.
+  #
+  # WAPE is total absolute error over total absolute truth. It is scale-aware
+  # without MAPE's blow-up near zero, no single row can dominate it, and it
+  # reads directly: 35 means the errors add up to 35% of the money. It is also
+  # the metric the tier table breaks out, so the headline and the segmented
+  # view are the same quantity.
+  headline_metric: wape
+
+  # Cut points for the account-size tiers, as quantiles of each entity's median
+  # absolute balance, computed on training months only.
+  #
+  # 0.5 and 0.9 gives smb / mid / enterprise at 50/40/10. The top decile is the
+  # group that owns the dollar totals and therefore hides inside every global
+  # average; the bottom half is the group those averages never described. Both
+  # are now reported separately, which is the point.
+  tier_quantiles: [0.5, 0.9]
+
 models:
   # Each entry becomes one fitted, scored candidate. `name` is free text, used
   # in result tables and saved filenames; `kind` picks the constructor from
@@ -104,13 +355,6 @@ models:
   - name: three_month_average
     kind: lag_average
     params: {n_months: 3}
-
-  # Last month's balance, unchanged. On a series this autocorrelated it is
-  # usually the harder of the two baselines to beat -- on the last recorded run
-  # it beat every fitted model.
-  - name: persistence
-    kind: lag_average
-    params: {n_months: 1}
 
   # Ridge on the movement, alpha chosen by RidgeCV over the folds above.
   #
@@ -147,7 +391,18 @@ models:
       # so roughly five minutes. Raise it for a final run; lower it, not the
       # fold count, if that gets in the way while iterating.
       n_iter: 20
-      scoring: neg_median_absolute_error   # matches evaluation.headline_metric
+      # Left empty by the edit that removed the `evaluation` block, which does
+      # not mean "default" -- RandomizedSearchCV reads an explicit null as
+      # "score with the estimator's own method", so it was silently already
+      # ranking candidates on R squared. Named here instead.
+      #
+      # R squared on the movement, which is what this booster fits. Kept on the
+      # dollar-movement candidates so the number stays comparable with the runs
+      # that came before; the scaled candidates below rank on MAE instead,
+      # matching their reg:absoluteerror objective. A search that ranks
+      # candidates on one loss while the fit minimises another is choosing
+      # parameters for a model it is not building.
+      scoring: r2
       space:
         max_depth:        [3, 4, 5, 6]
         learning_rate:    {low: 0.01, high: 0.2, log: true}
@@ -156,26 +411,99 @@ models:
         min_child_weight: [1, 5, 10, 20]
         reg_lambda:       {low: 0.1, high: 10.0, log: true}
 
-evaluation:
-  # Every skill score is measured against this model, so it has to name one of
-  # the entries above.
-  reference_model: three_month_average
+  # ---------------------------------------------------------------------------
+  # The same two models on the scale-free target.
+  #
+  # Everything above fits a movement in dollars, and on this panel that is the
+  # core defect: a user's ordinary month-to-month movement ranges over three
+  # orders of magnitude, so a dollar of error on a small account and a dollar
+  # on a large one are treated as the same event when they are not remotely
+  # comparable. The holdout said so plainly -- RMSE 136,969 against a median
+  # absolute error of 5,309, which is a model that is adequate for most users
+  # and hopeless for a few, fitted mostly to the few.
+  #
+  # scaled_change divides each user's movement by that user's own robust
+  # typical movement (MAD, fitted on training rows only -- see
+  # src/models_code/entity_scaler.py). After that division a row's contribution
+  # to the loss is "how unusual is this month for this account", which is the
+  # question the model is actually being asked. Predictions are multiplied back
+  # and the anchor added, so these are scored in dollars alongside everything
+  # else and the results table stays one table.
+  # ---------------------------------------------------------------------------
 
-  # Last month's balance. The change framing subtracts it from both the truth
-  # and the prediction, which stops a flattering R squared on the level hiding
-  # the difference between models. See the docstring in src/metrics.py.
-  anchor_column: prev_1m_closing_balance_usd
+  # KEPT BECAUSE IT FAILS, and the way it fails is worth having in the table.
+  #
+  # Holdout r2_change -35.3 against ridge_change's -0.0004: the same estimator,
+  # the same features, the only difference being the target axis. The mechanism
+  # is visible in the run log, which reports alpha settling at 1e+06, the top of
+  # the grid -- cross-validation wants every coefficient at zero, so the model
+  # degenerates to predicting a constant.
+  #
+  # A constant is harmless in change mode: it predicts the average dollar
+  # movement, which is small. In scaled mode it is a catastrophe, because the
+  # constant is multiplied back by each account's own scale on the way out. A
+  # constant of 0.05 becomes 50 dollars for a small account and 25,000 for a
+  # whale -- the model ends up predicting a movement PROPORTIONAL TO ACCOUNT
+  # VOLATILITY for every row, which is close to the worst systematic error
+  # available on this panel.
+  #
+  # The general lesson, and the reason this is not quietly deleted: scaling the
+  # target does not make a model that has learned nothing harmless. It changes
+  # what "nothing" costs. The boosters below do not hit this because they do not
+  # degenerate to a constant, but any linear model regularised to the grid edge
+  # on a scaled target will.
 
-  # Rows with a smaller absolute balance than this are left out of the
-  # percentage error, which would otherwise explode on balances near zero.
-  mape_floor: 1000.0
+  # This was a bad fit
+  #- name: ridge_scaled
+  #  kind: ridge
+  #  params:
+  #    target_mode: scaled_change
 
-  # Which column the comparison is ranked on. median_ae rather than rmse: on the
-  # holdout the ten worst users carry 73% of the total squared error, so ranking
-  # on RMSE ranks models by how well they fit ten accounts out of 150. Set to
-  # rmse for the conventional ordering, or p90_ae to rank on the tail.
-  headline_metric: median_ae
+  - name: xgboost_scaled
+    kind: xgboost
+    params:
+      target_mode: scaled_change
+      # Linear in the error rather than quadratic. Explicit because the library
+      # default is reg:squarederror, which is what this was silently running.
+      objective: reg:absoluteerror
+    search:
+      n_iter: 20
+      # Matched to the objective above. Ranking on r2 here would pick
+      # parameters that minimise squared error for a model fitting absolute
+      # error.
+      scoring: neg_mean_absolute_error
+      space:
+        max_depth:        [3, 4, 5, 6]
+        learning_rate:    {low: 0.01, high: 0.2, log: true}
+        subsample:        {low: 0.6, high: 1.0}
+        colsample_bytree: {low: 0.6, high: 1.0}
+        min_child_weight: [1, 5, 10, 20]
+        reg_lambda:       {low: 0.1, high: 10.0, log: true}
+
+  # The log framing from the brief, made usable on a target that goes negative:
+  # sign(x)*log1p(|x|) instead of log(1+x). Kept as a candidate rather than the
+  # default because its inverse is sensitive near zero, where a fair number of
+  # these accounts sit -- it is here to be measured against ridge_scaled, not
+  # assumed better.
+  - name: xgboost_signed_log
+    kind: xgboost
+    params:
+      target_mode: signed_log_change
+      objective: reg:absoluteerror
 
 output:
   # Relative to /app in the container, which is the bind-mounted ./models.
+  #
+  # One file per model, named for its `name` above and overwritten on every
+  # training run: models/three_month_average.joblib, models/ridge_change.joblib
+  # and so on. No timestamps and no run summaries -- the file IS the record. It
+  # carries the fitted preprocessing, the months it was trained on and the
+  # columns it expects, which is everything src/test.py needs to score it
+  # without re-deriving anything.
   model_dir: models
+
+  # Destination for `python -m src.export_features`, which materialises the
+  # engineered feature table so it can be read with SQL instead of existing
+  # only in memory during a run. A snapshot: nothing refreshes it, and nothing
+  # reads it unless you point `data.query` at it.
+  feature_table: features_table_two

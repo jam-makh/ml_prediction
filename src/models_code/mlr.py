@@ -209,8 +209,8 @@ class RidgeRegression(AnchoredModel):
             Fold index pairs, or None when the training region is too short to
             produce any -- in which case ``RidgeCV`` uses leave-one-out.
         """
-        # Imported here rather than at module scope: tuning imports splitting,
-        # splitting imports data, and a top-level import would make the model
+        # Imported here rather than at module scope: tuning imports window,
+        # window imports data, and a top-level import would make the model
         # modules depend on the search machinery just to define a class.
         from src.tuning import month_folds
 

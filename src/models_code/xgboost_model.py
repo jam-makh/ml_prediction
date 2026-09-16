@@ -54,6 +54,35 @@ EARLY_STOPPING_CAP = 2_000
 # ride out the noise of a three-month eval window.
 EARLY_STOPPING_ROUNDS = 50
 
+# The loss. XGBoost's own default is reg:squarederror, and because this class
+# never named an objective it was silently running it -- the worst available
+# choice on this panel. Squared error weights a row by the square of its error,
+# so on a target where one account moves by 500,000 and another by 500, a
+# single enterprise row counts for a million times what a small one does: the
+# booster was being fitted almost entirely to a handful of users.
+#
+# reg:absoluteerror weights every row by the size of its error instead, which
+# is linear, so a whale is merely large rather than decisive. It pairs with the
+# scaled target rather than substituting for it -- scaling makes the rows
+# comparable, the objective stops the remaining outliers from dominating what
+# is left.
+#
+# reg:pseudohubererror is the middle option, quadratic near zero and linear in
+# the tail; it needs huber_slope, which is on the scaled axis, so roughly
+# "how many typical monthly movements is still an ordinary error".
+DEFAULT_OBJECTIVE = "reg:absoluteerror"
+
+# The metric early stopping watches, matched to the objective. These have to
+# agree: stopping on RMSE while fitting MAE picks the round count that is best
+# for a loss the model is not minimising, and the run before this change showed
+# exactly that kind of instability -- stopping rounds of 129, 20 and 1 across
+# three folds.
+OBJECTIVE_EVAL_METRICS: dict[str, str] = {
+    "reg:absoluteerror": "mae",
+    "reg:squarederror": "rmse",
+    "reg:pseudohubererror": "mphe",
+}
+
 
 class XGBoostModel(AnchoredModel):
     """Gradient boosted trees over the feature table.
@@ -87,6 +116,14 @@ class XGBoostModel(AnchoredModel):
         L2 penalty on leaf weights. Default 1.0.
     random_state : int, optional
         Default 42.
+    objective : str, optional
+        The loss. Default ``reg:absoluteerror``; see ``DEFAULT_OBJECTIVE``.
+        Named explicitly rather than left to the library, because the library's
+        default is the one choice this data cannot afford.
+    eval_metric : str, optional
+        What early stopping watches. Defaults to the metric that matches
+        ``objective``, which is almost always what is wanted -- pass it only to
+        deliberately stop on something other than the loss being fitted.
     n_jobs : int, optional
         Default 1. Single threaded so two runs of one config produce the same
         numbers: tree building is order-dependent across threads, and a model
@@ -110,9 +147,11 @@ class XGBoostModel(AnchoredModel):
     def __init__(
         self,
         name: str = "xgboost",
-        target_mode: TargetMode = "change",
+        target_mode: TargetMode = "scaled_change",
         anchor_column: str = "prev_1m_closing_balance_usd",
         search: dict[str, Any] | None = None,
+        objective: str = DEFAULT_OBJECTIVE,
+        eval_metric: str | None = None,
         n_estimators: int = 300,
         max_depth: int = 4,
         learning_rate: float = 0.05,
@@ -132,6 +171,8 @@ class XGBoostModel(AnchoredModel):
         )
         self.random_state = random_state
         self.params: dict[str, Any] = {
+            "objective": objective,
+            "eval_metric": eval_metric or OBJECTIVE_EVAL_METRICS.get(objective, "rmse"),
             "n_estimators": n_estimators,
             "max_depth": max_depth,
             "learning_rate": learning_rate,
@@ -221,7 +262,7 @@ class XGBoostModel(AnchoredModel):
         -------
         None
         """
-        # Imported here rather than at module scope: tuning imports splitting,
+        # Imported here rather than at module scope: tuning imports window,
         # and a top-level import would make this module depend on the search
         # machinery just to define the class.
         from src.tuning import month_folds, run_search

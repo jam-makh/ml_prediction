@@ -2,7 +2,8 @@
 # PostgreSQL that is already running on the host and published on port 5433;
 # the job here only reads a table from it.
 #
-# That leaves exactly one service: the training job.
+# That leaves two services, which are the two halves of the pipeline: the
+# job that fits and saves the models, and the job that scores what it saved.
 
 services:
   # The production-shaped half of the pipeline: a batch job, not a server.
@@ -59,3 +60,32 @@ services:
       # that they outlive the container.
       - ./models:/app/models
     # No `ports`. This is a job that runs and exits, not a service to reach.
+
+  # The other half: score the models `train` saved, on months none of them has
+  # seen. A separate service for the same reason it is a separate script -- a
+  # job that both fits and reports the headline number can always be edited
+  # into one that reports a number it fitted on.
+  #
+  #   docker compose run --rm test
+  #
+  # Reads ./models rather than writing it: this service produces a table on
+  # stdout and no artefacts. Everything it needs to know about the train/test
+  # boundary is inside the saved model files.
+  test:
+    build: .
+    image: ml-prediction-train
+    command: ["python", "-m", "src.test"]
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER in .env (see .env.example)}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env (see .env.example)}
+      POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB in .env (see .env.example)}
+      POSTGRES_HOST: host.docker.internal
+      POSTGRES_PORT: ${POSTGRES_PORT:-5433}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./src:/app/src:ro
+      - ./config:/app/config:ro
+      # Read-only: scoring must not be able to overwrite the artefact it is
+      # scoring.
+      - ./models:/app/models:ro

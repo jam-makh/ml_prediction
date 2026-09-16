@@ -102,6 +102,31 @@ class Scores(BaseModel):
     median_ae : float
         Median absolute error. What a typical user experiences, as opposed to
         what the average is dragged to by a handful of very large accounts.
+    wape : float
+        Weighted absolute percentage error: total absolute error divided by
+        total absolute truth, as a percentage. The headline number.
+
+        It is the percentage error that survives this data. MAPE divides each
+        row by its own truth, so a balance near zero produces an enormous
+        percentage and the mean becomes meaningless -- which is why ``mape``
+        below needs a 1,000 USD floor and a coverage figure to be quotable at
+        all. WAPE shares one denominator across the whole set, so no single
+        row can explode, and it stays interpretable: 0.35 means the errors add
+        up to 35% of the money being predicted. Unlike RMSE it is not dominated
+        by the squared tail, and unlike median_ae it does not ignore the tail
+        entirely.
+
+        Read it per tier as well as globally -- a good global WAPE on a panel
+        this skewed can be a good number on the whales and a bad one on
+        everybody else.
+    smape : float
+        Symmetric mean absolute percentage error, 0-200. The scale-free view of
+        the same errors: every row contributes comparably regardless of how
+        large the account is, which neither MAE nor RMSE does on a target this
+        skewed. Read as reporting rather than as a decision rule -- the shared
+        denominator keeps it finite where MAPE explodes, but it is still
+        unstable when truth and prediction are both near zero. NaN when no row
+        had a non-zero denominator.
     r2_level : float
         Variance of the balance level explained. The flattering number, near
         1.000 for anything at all, reported so the report can say so out loud.
@@ -129,6 +154,8 @@ class Scores(BaseModel):
     rmse: float
     mae: float
     median_ae: float
+    wape: float = float("nan")
+    smape: float = float("nan")
     r2_level: float
     r2_change: float = float("nan")
     n_rows_change: int = 0
@@ -147,7 +174,8 @@ class Scores(BaseModel):
         """
         line = (
             f"RMSE {self.rmse:>13,.0f} | MAE {self.mae:>12,.0f} | "
-            f"MAE {self.median_ae:>11,.0f} | "
+            f"MedAE {self.median_ae:>11,.0f} | WAPE {self.wape:>6.1f}% | "
+            f"sMAPE {self.smape:>6.1f}% | "
             f"R2 level {self.r2_level:>6.3f} | R2 change {self.r2_change:>7.3f}"
         )
         if self.skill is not None:
@@ -255,6 +283,45 @@ def _mape(
     return float(100.0 * errors.mean()), coverage
 
 
+def _smape(y_true: FloatArray, y_pred: FloatArray) -> float:
+    """Compute the symmetric mean absolute percentage error.
+
+    ``mean(2 * |y - yhat| / (|y| + |yhat|)) * 100``, so the denominator moves
+    with the prediction as well as the truth. That is what bounds the result at
+    200 and stops one near-zero balance from owning the average the way it does
+    in a plain MAPE -- but it does not rescue the case where truth and
+    prediction are both near zero, and those rows are skipped rather than
+    counted as a division by zero.
+
+    Parameters
+    ----------
+    y_true : numpy.ndarray of float
+        True values.
+    y_pred : numpy.ndarray of float
+        Predicted values, aligned to ``y_true``.
+
+    Returns
+    -------
+    float
+        Percentage error between 0 and 200, or NaN when every row had a zero
+        denominator.
+    """
+    denominator = np.abs(y_true) + np.abs(y_pred)
+    usable = denominator > 0.0
+    if not usable.any():
+        return float("nan")
+    ratio = 2.0 * np.abs(y_true[usable] - y_pred[usable]) / denominator[usable]
+    return float(100.0 * ratio.mean())
+
+
+# Cut points for the account-size tiers, as quantiles of each entity's median
+# absolute balance. 0.5 and 0.9 gives a half/40/10 split: an SMB half that the
+# global dollar metrics currently say nothing about, a mid band, and the top
+# decile that owns most of the squared error and needs to be looked at on its
+# own rather than through an average it dominates.
+DEFAULT_TIER_QUANTILES: tuple[float, float] = (0.5, 0.9)
+
+
 def score(
     y_true: pd.Series | FloatArray,
     y_pred: pd.Series | FloatArray,
@@ -298,6 +365,8 @@ def score(
     rmse = float(np.sqrt(np.mean(np.square(errors))))
     mae = float(np.mean(np.abs(errors)))
     median_ae = float(np.median(np.abs(errors)))
+    wape = _wape(truth, prediction)
+    smape = _smape(truth, prediction)
     mape, coverage = _mape(truth, prediction, mape_floor)
 
     r2_change = float("nan")
@@ -328,6 +397,8 @@ def score(
         rmse=rmse,
         mae=mae,
         median_ae=median_ae,
+        wape=wape,
+        smape=smape,
         r2_level=r_squared(truth, prediction),
         r2_change=r2_change,
         n_rows_change=n_rows_change,
@@ -335,6 +406,85 @@ def score(
         mape_coverage=coverage,
         skill=skill,
     )
+
+
+def _wape(
+    truth: FloatArray, prediction: FloatArray
+) -> float:
+    """Return the weighted absolute percentage error, as a percentage.
+
+    Parameters
+    ----------
+    truth : numpy.ndarray of float
+        True values, already reduced to the finite rows.
+    prediction : numpy.ndarray of float
+        Predicted values, aligned row for row.
+
+    Returns
+    -------
+    float
+        ``100 * sum|truth - prediction| / sum|truth|``, or NaN when every true
+        value is zero and there is no denominator to divide by.
+    """
+    denominator = float(np.sum(np.abs(truth)))
+    if denominator <= 0.0:
+        return float("nan")
+    return 100.0 * float(np.sum(np.abs(truth - prediction))) / denominator
+
+
+def assign_tiers(
+    entities: pd.Series,
+    balances: pd.Series,
+    quantiles: tuple[float, float] = DEFAULT_TIER_QUANTILES,
+) -> pd.Series:
+    """Bucket entities into operational tiers by typical account size.
+
+    The brief asks for metrics per account-size bucket rather than one global
+    RMSE, and for good reason: on this panel the top handful of users own most
+    of the squared error, so a single number describes them and nobody else.
+    A tier breakdown is what shows whether a model that looks adequate overall
+    is actually adequate for the 80% of accounts that are small.
+
+    Parameters
+    ----------
+    entities : pandas.Series
+        Entity id per row. Must come from TRAINING rows only -- see Notes.
+    balances : pandas.Series
+        The balance to size entities by, aligned row for row with
+        ``entities``. Normally the anchor column.
+    quantiles : tuple of float, optional
+        The two cut points, as quantiles of the per-entity median balance.
+        Default ``DEFAULT_TIER_QUANTILES``.
+
+    Returns
+    -------
+    pandas.Series
+        Tier name indexed by entity id: ``smb``, ``mid`` or ``enterprise``.
+
+    Notes
+    -----
+    Sized on the MEDIAN of each entity's balances, not the mean or the latest:
+    the median is the account's ordinary size, and it is not moved by the one
+    spike that put the account in the news. Sized in ABSOLUTE value because
+    three quarters of these balances are negative -- these are liability
+    accounts, and a large debt is a large account.
+
+    The caller must pass training rows only. Tiering on the whole panel would
+    let an account's holdout months decide which bucket its holdout months are
+    then scored in, which is a small leak but a real one and an easy one to
+    avoid.
+    """
+    typical = (
+        pd.DataFrame({"entity": entities.to_numpy(), "balance": balances.to_numpy()})
+        .groupby("entity")["balance"]
+        .apply(lambda values: float(np.nanmedian(np.abs(values.to_numpy(dtype="float64")))))
+    )
+    low, high = (float(typical.quantile(q)) for q in quantiles)
+    tiers = pd.Series("mid", index=typical.index, dtype="object")
+    tiers.loc[typical <= low] = "smb"
+    tiers.loc[typical > high] = "enterprise"
+    tiers.index.name = "entity"
+    return tiers
 
 
 def score_by_group(
@@ -381,6 +531,16 @@ def score_by_group(
         rmse=("error", lambda errors: float(np.sqrt(np.mean(np.square(errors))))),
         mae=("absolute_error", "mean"),
         median_ae=("absolute_error", "median"),
+    )
+    # WAPE needs both sums from the same group, so it is computed alongside the
+    # aggregation rather than inside it. This is the column to read across
+    # tiers: the dollar errors are not comparable between an SMB bucket and an
+    # enterprise one, and a percentage is.
+    totals = frame.assign(absolute_truth=frame["truth"].abs()).groupby(
+        "group", dropna=False
+    )[["absolute_error", "absolute_truth"]].sum()
+    summary["wape"] = 100.0 * (
+        totals["absolute_error"] / totals["absolute_truth"].replace(0.0, np.nan)
     )
     summary.index.name = label
     return summary.sort_values("rmse", ascending=False)
