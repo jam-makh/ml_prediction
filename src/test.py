@@ -39,33 +39,25 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+from loguru import logger
 
+from src.log import setup_logging
 from src.config.config import load_config, resolve_output_dir
 from src.data.data import Dataset, build_dataset
 from src.evaluate import (
+    AMOUNT_COLUMNS,
+    MOVEMENT_COLUMNS,
     EvaluationReport,
     EvaluationSettings,
     evaluate_models,
     report_table,
+    results_table,
     tier_table,
     worst_months_table,
     worst_users_table,
 )
 from src.metrics import assign_tiers
 from src.models_code.base_class import Model
-
-# Columns the headline comparison shows, in reading order. Kept short on
-# purpose: the full set is in `report_table` and printed below it, but the
-# question this table answers is "which model, and by how much", and a table
-# with fifteen columns does not answer it at a glance.
-LEADERBOARD_COLUMNS: tuple[str, ...] = (
-    "rmse",
-    "mae",
-    "median_ae",
-    "wape",
-    "r2_change",
-    "skill",
-)
 
 
 def load_models(config: dict[str, Any]) -> dict[str, Model]:
@@ -204,7 +196,9 @@ def split_on_boundary(
 
 
 def leaderboard(
-    reports: dict[str, EvaluationReport], sort_by: str = "wape"
+    reports: dict[str, EvaluationReport],
+    columns: dict[str, str],
+    sort_by: str = "wape",
 ) -> pd.DataFrame:
     """Lay the models out as one short table, best first.
 
@@ -212,17 +206,17 @@ def leaderboard(
     ----------
     reports : dict of str to EvaluationReport
         One report per model.
+    columns : dict of str to str
+        ``AMOUNT_COLUMNS`` or ``MOVEMENT_COLUMNS``.
     sort_by : str, optional
         Column to rank on. Default ``wape``.
 
     Returns
     -------
     pandas.DataFrame
-        One row per model, restricted to ``LEADERBOARD_COLUMNS``.
+        One row per model: ``r2``, ``mae``, ``rmse`` and ``wape``.
     """
-    table = report_table(reports, sort_by=sort_by)
-    columns = [name for name in LEADERBOARD_COLUMNS if name in table.columns]
-    return table.loc[:, columns]
+    return results_table(report_table(reports), columns, sort_by=sort_by)
 
 
 def run(config: dict[str, Any] | None = None) -> dict[str, EvaluationReport]:
@@ -247,10 +241,10 @@ def run(config: dict[str, Any] | None = None) -> dict[str, EvaluationReport]:
     dataset = build_dataset(settings)
     seen, test = split_on_boundary(dataset, boundary)
 
-    print(f"Data      : {dataset.summary()}")
-    print(f"Models    : {', '.join(models)}")
-    print(f"Trained   : through {boundary:%Y-%m} (read from the saved models)")
-    print(
+    logger.info(f"Data      : {dataset.summary()}")
+    logger.info(f"Models    : {', '.join(models)}")
+    logger.info(f"Trained   : through {boundary:%Y-%m} (read from the saved models)")
+    logger.info(
         f"Scoring   : {test.n_rows:,} rows over "
         f"{test.months[0]:%Y-%m}..{test.months[-1]:%Y-%m}, "
         f"{len(test.months)} month(s) no model has seen"
@@ -279,28 +273,36 @@ def run(config: dict[str, Any] | None = None) -> dict[str, EvaluationReport]:
         tiers=tiers,
     )
 
-    print(f"\n=== Comparison (sorted by {evaluation.headline_metric}, lower is better)")
-    table = leaderboard(reports, sort_by=evaluation.headline_metric)
-    print(table.to_string(float_format=lambda value: f"{value:,.3f}"))
-    print(
-        f"\n  skill is measured against {evaluation.reference_model}: "
-        f"positive means better than it, 0 means no better.\n"
-        f"  r2_change is scored against the movement, not the balance level. "
-        f"Read that one, not r2_level:\n"
-        f"  every model here scores above 0.8 on the level, the 3-month "
-        f"average included, because the level barely moves."
+    fmt = lambda value: f"{value:,.3f}"  # noqa: E731
+
+    logger.info(f"\n=== Amounts: the balance itself (sorted by {evaluation.headline_metric})")
+    table = leaderboard(reports, AMOUNT_COLUMNS, sort_by=evaluation.headline_metric)
+    logger.info(table.to_string(float_format=fmt))
+
+    logger.info(
+        f"\n=== Movements: change from last month's balance "
+        f"(sorted by {evaluation.headline_metric})"
+    )
+    movements = leaderboard(
+        reports, MOVEMENT_COLUMNS, sort_by=evaluation.headline_metric
+    )
+    logger.info(movements.to_string(float_format=fmt))
+    logger.info(
+        "\n  wape is a percentage. r2 below 0 on movements means worse than "
+        "predicting no change.\n  mae and rmse are the same dollar errors in "
+        "both tables, less the rows with no previous month."
     )
 
-    print("\n=== Per model")
+    logger.info("\n=== Per model")
     for name in table.index:
-        print(f"\n  {reports[str(name)].describe()}")
+        logger.info(f"\n  {reports[str(name)].describe()}")
 
     # Where the winner is worst, which is the part a single number cannot say.
     best_name = str(table.index[0])
     best = reports[best_name]
 
-    print(f"\n=== {best_name}: months scored, worst first")
-    print(
+    logger.info(f"\n=== {best_name}: months scored, worst first")
+    logger.info(
         worst_months_table(best).to_string(float_format=lambda value: f"{value:,.0f}")
     )
 
@@ -310,11 +312,11 @@ def run(config: dict[str, Any] | None = None) -> dict[str, EvaluationReport]:
         # adequate overall can be adequate on the enterprise tier that
         # dominates the dollar totals and useless on the half of accounts that
         # are small.
-        print(f"\n=== {best_name}: by account-size tier")
-        print(tiers_table.to_string(float_format=lambda value: f"{value:,.1f}"))
+        logger.info(f"\n=== {best_name}: by account-size tier")
+        logger.info(tiers_table.to_string(float_format=lambda value: f"{value:,.1f}"))
 
-    print(f"\n=== {best_name}: worst users")
-    print(worst_users_table(best).to_string(float_format=lambda value: f"{value:,.0f}"))
+    logger.info(f"\n=== {best_name}: worst users")
+    logger.info(worst_users_table(best).to_string(float_format=lambda value: f"{value:,.0f}"))
 
     return reports
 
@@ -326,7 +328,9 @@ def main() -> None:
     -------
     None
     """
-    run()
+    settings = load_config()
+    logger.info(f"Logging to {setup_logging(settings, run_name='test')}")
+    run(settings)
 
 
 if __name__ == "__main__":

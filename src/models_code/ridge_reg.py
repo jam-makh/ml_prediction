@@ -1,10 +1,5 @@
-"""The linear model: ridge regression on the movement.
-
-The model that can be explained to a stakeholder. Its job in the comparison is
-to be the thing the boosted trees have to beat by enough to justify losing that
-explanation.
-
-**Ridge rather than plain least squares.** The feature table carries three
+"""
+*Ridge rather than plain least squares. The feature table carries three
 closing-balance lags that move together closely, and until the redundant
 aggregates are dropped from the config it is also exactly rank deficient --
 ``delta_prev_1m_2m`` is the difference of two lags that are both still present,
@@ -14,22 +9,12 @@ to the pseudo-inverse, so coefficients come out but which ones is arbitrary
 within the null space. Ridge is defined either way, and with merely correlated
 columns it spreads the weight across the group instead of picking one at random.
 
-**Ridge rather than lasso**, for the same reason in reverse: lasso keeps one
+Ridge rather than lasso, for the same reason in reverse: lasso keeps one
 member of a correlated group and zeroes the rest, and which member it keeps
 flips between folds. That makes it a poor basis for deciding what to drop, and
 on standardised money columns its coordinate descent needs a raised iteration
 cap to stop warning on every fit.
-
-``alpha`` is not guessed. ``RidgeCV`` picks it over the same expanding month
-folds everything else is scored on, which costs very little -- ridge has a
-closed-form solution per alpha.
-
-**Preprocessing is scikit-learn's own.** Imputation and scaling sit in a
-``Pipeline`` inside this class, so they are fitted on the training rows the
-model was handed and cannot be fitted before a split by accident. Scaling is not
-optional here: a penalty applied to unscaled coefficients penalises whichever
-feature happens to be measured in small units, which on a table mixing balances
-in the tens of thousands with transaction counts in the tens is most of them.
+]
 """
 
 from __future__ import annotations
@@ -39,6 +24,7 @@ from typing import Any
 import numpy as np
 import numpy.typing as npt
 import pandas as pd
+from loguru import logger
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import Ridge, RidgeCV
 from sklearn.pipeline import Pipeline
@@ -177,7 +163,7 @@ class RidgeRegression(AnchoredModel):
             # search running out of room, and the two ends mean opposite things.
             # Said out loud rather than left in the summary for someone to spot.
             if self.alphas and picked >= max(self.alphas):
-                print(
+                logger.warning(
                     f"  {self.name}: alpha settled on {picked:g}, the top of the "
                     f"grid -- cross-validation wants every coefficient at zero, "
                     f"so this model is predicting the mean movement and nothing "
@@ -185,7 +171,7 @@ class RidgeRegression(AnchoredModel):
                     f"finding about the features, not about alpha."
                 )
             elif self.alphas and picked <= min(self.alphas):
-                print(
+                logger.warning(
                     f"  {self.name}: alpha settled on {picked:g}, the bottom of "
                     f"the grid -- the fit wants less penalty than it was "
                     f"offered. Widen DEFAULT_ALPHAS downward in mlr.py."
@@ -239,8 +225,12 @@ class RidgeRegression(AnchoredModel):
             One prediction per row, on the balance scale in both modes.
         """
         assert self._pipeline is not None  # guaranteed by Model.predict
+        # The columns this model was fitted on, not the dataset's own feature
+        # list: each model family can drop different columns, and the dataset
+        # handed in at scoring time carries the widest list.
         predicted = np.asarray(
-            self._pipeline.predict(dataset.features), dtype="float64"
+            self._pipeline.predict(dataset.frame.loc[:, list(self.feature_columns)]),
+            dtype="float64",
         )
         return self._restore_level(dataset, predicted)
 

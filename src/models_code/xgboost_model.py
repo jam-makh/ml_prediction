@@ -153,6 +153,7 @@ class XGBoostModel(AnchoredModel):
         objective: str = DEFAULT_OBJECTIVE,
         eval_metric: str | None = None,
         n_estimators: int = 300,
+        min_estimators: int = 1,
         max_depth: int = 4,
         learning_rate: float = 0.05,
         subsample: float = 0.8,
@@ -185,8 +186,10 @@ class XGBoostModel(AnchoredModel):
             **params,
         }
 
+        self.min_estimators = int(min_estimators)
         self.best_iteration_: int | None = None
         self.stopping_rounds_: list[int] = []
+        self.stopping_floored_ = False
         self._estimator: XGBRegressor | None = None
 
     def _build(self, **overrides: Any) -> XGBRegressor:
@@ -312,8 +315,22 @@ class XGBoostModel(AnchoredModel):
             # +1 because best_iteration is a zero-based index into the rounds.
             rounds.append(int(stopper.best_iteration) + 1)
 
-        self.best_iteration_ = int(np.median(rounds))
+        # Early stopping on this panel collapses. Across runs it has chosen 4,
+        # 5 and 6 rounds -- a booster of six stumps, which cannot represent an
+        # interaction between a user's segment and their own lagged movement
+        # even when one is there. The stall is real (the marginal round does
+        # not improve holdout MAE) but "no further improvement" and "the model
+        # is finished" are different claims, and only the first is measured.
+        #
+        # The floor is the second claim, stated in the config rather than
+        # discovered: fit at least this many rounds, then let regularisation
+        # and subsampling handle the rest. Recorded on the model so the run log
+        # can say the floor bound rather than quietly pretending the search
+        # chose it.
+        chosen = int(np.median(rounds))
         self.stopping_rounds_ = rounds
+        self.stopping_floored_ = chosen < self.min_estimators
+        self.best_iteration_ = max(chosen, self.min_estimators)
 
     def _predict(self, dataset: Dataset) -> npt.NDArray[np.float64]:
         """Predict, putting the level back together in change mode.
@@ -329,32 +346,42 @@ class XGBoostModel(AnchoredModel):
             One prediction per row, on the balance scale in both modes.
         """
         assert self._estimator is not None  # guaranteed by Model.predict
+        # The columns this model was fitted on; see RidgeRegression._predict.
         predicted = np.asarray(
-            self._estimator.predict(dataset.features), dtype="float64"
+            self._estimator.predict(dataset.frame.loc[:, list(self.feature_columns)]),
+            dtype="float64",
         )
         return self._restore_level(dataset, predicted)
 
-    def feature_importance(self) -> pd.Series | None:
-        """Return importance by gain, largest first.
+    def feature_importance(self, importance_type: str = "gain") -> pd.Series | None:
+        """Return the booster's importance per feature, largest first.
+
+        Parameters
+        ----------
+        importance_type : str, optional
+            Any type XGBoost's ``get_score`` accepts: ``gain`` (average loss
+            reduction per split), ``total_gain`` (summed over every split),
+            ``weight`` (number of splits), ``cover`` (average rows reached per
+            split) or ``total_cover``. Default ``gain``.
 
         Returns
         -------
         pandas.Series or None
-            Gain per feature name, descending, or None before fitting. Features
-            the booster never split on appear at zero rather than being
-            dropped, so the series always covers every input column -- which is
-            what makes it an answer to "which columns carry the model" rather
-            than only a list of the ones that do.
+            Value per feature name, descending, or None before fitting.
+            Features the booster never split on appear at zero rather than
+            being dropped, so the series always covers every input column --
+            which is what makes it an answer to "which columns carry the model"
+            rather than only a list of the ones that do.
         """
         if not self.is_fitted or self._estimator is None:
             return None
 
-        scores = self._estimator.get_booster().get_score(importance_type="gain")
-        gains = pd.Series(
+        scores = self._estimator.get_booster().get_score(importance_type=importance_type)
+        values = pd.Series(
             {name: float(value) for name, value in scores.items()}, dtype="float64"
         )
-        complete = gains.reindex(list(self._feature_columns), fill_value=0.0)
-        complete.name = "gain"
+        complete = values.reindex(list(self._feature_columns), fill_value=0.0)
+        complete.name = importance_type
         return complete.sort_values(ascending=False)
 
     def describe(self) -> str:
@@ -370,7 +397,15 @@ class XGBoostModel(AnchoredModel):
         importance = self.feature_importance()
         used = int((importance > 0).sum()) if importance is not None else 0
         rounds = self.best_iteration_ or self.params["n_estimators"]
-        stopped = " (early stopped)" if self.best_iteration_ else ""
+        if self.stopping_floored_:
+            stopped = (
+                f" (early stopping wanted {int(np.median(self.stopping_rounds_))}"
+                f", floored to min_estimators={self.min_estimators})"
+            )
+        elif self.best_iteration_:
+            stopped = " (early stopped)"
+        else:
+            stopped = ""
         return (
             f"{self.name}: {rounds} trees{stopped}, depth "
             f"{self.params['max_depth']}, lr {self.params['learning_rate']:g}, "

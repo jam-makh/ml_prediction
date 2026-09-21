@@ -1,211 +1,184 @@
 # ml_prediction
 
-Feature selection and regression models on data read from an existing
-PostgreSQL instance.
+Forecasting next month's closing balance per user, from a monthly feature table
+in an existing PostgreSQL instance (read-only, `localhost:5433`).
 
+```bash
+python pipeline.py
+```
+
+One command, no arguments. Every setting lives in `config/ml_config.yaml`;
+an experiment is a config edit, not a flag.
+
+## The pipeline
+
+```mermaid
+flowchart TD
+    DB[("PostgreSQL<br/>feature_store_monthly_v2<br/><i>read-only, SELECT *</i>")]
+    DB --> BUILD
+
+    subgraph BUILD["build_dataset -- src/data/data.py"]
+        direction TB
+        B1["type, validate, drop rows with no target"]
+        B2["trim_whale_entities<br/><i>rank on TRAINING months only</i>"]
+        B1 --> B2
+    end
+
+    BUILD --> CUT{"holdout_split<br/>last 8 months"}
+
+    CUT -->|"35 months"| TRAIN
+    CUT -->|"8 months, sealed"| TEST
+
+    subgraph TRAIN["src/train.py -- never sees the holdout"]
+        direction TB
+        T1["5 expanding CV folds"]
+        T2["randomised search + early stopping<br/><i>xgboost only</i>"]
+        T3["refit on all 35 months -> models/*.joblib"]
+        T1 --> T2 --> T3
+    end
+
+    TRAIN --> TEST
+
+    subgraph TEST["src/test.py -- scores the sealed months"]
+        direction TB
+        S1["predict the CHANGE, add back the anchor"]
+        S2["score vs <b>persistence</b>"]
+        S1 --> S2
+    end
+
+    TEST --> TABLE["pipeline.py<br/>train vs test table"]
+    TRAIN -.->|"in-sample only, clearly labelled"| TABLE
+
+    style DB fill:#e8e8e8,stroke:#555
+    style TEST fill:#fff4e6,stroke:#d68910
+    style TABLE fill:#e8f4ea,stroke:#2d7a3e
+```
+
+The split between `train.py` and `test.py` is the point: the module that fits
+cannot read the months the module that scores uses. In-sample scores are
+computed in `pipeline.py` alone, in one labelled place.
+
+## The five things that matter
+
+**1. The target is the movement, not the level.** A user's balance next month
+is mostly their balance this month, so `r2_level` reads ~1.000 for a predictor
+a person could do in their head. `r2_change` puts the month-to-month movement
+in the denominator instead. Negative means worse than assuming nothing moves.
+Same dollar errors, different denominator — and the disagreement is the finding.
+
+**2. The reference is persistence, not the 3-month average.** The 3-month
+average is the *worst* predictor in the table (WAPE 22.5, `r2_change` −4.2), so
+skill measured against it flatters everything. The booster read **+0.561**
+against the 3-month average and **+0.002** against persistence. Only the second
+number means anything. Set in `evaluation.reference_model`.
+
+**3. `gap` is over MAE, not RMSE.** RMSE here is decided by a handful of very
+large accounts, so the RMSE ratio measures how calm those accounts happened to
+be in the holdout window rather than how hard the model fitted — persistence,
+which cannot overfit by construction, scored the same 0.81 as the booster. Over
+MAE the two separate at 2.3x and 2.5x. A diagnostic a constant predictor passes
+is not a diagnostic.
+
+**4. WAPE is the headline, and it is not comparable across trim levels.** Total
+absolute error over total absolute truth. MAPE divides each row by its own
+truth and these balances pass through zero. Removing whales moves WAPE's
+denominator, so WAPE compares models *within* a dataset — never across two.
+Use `skill` and `gap` for that.
+
+**5. The whale trim removes users, not rows.** `data.trim_top_entities` drops
+the largest share of *entities*, ranked on median `|prev_1m_closing_balance_usd|`
+over the training months only. Trimming the largest *rows* would gap each user's
+own lag features and would select on the target. It is a statement about which
+population is served, not a cleaning step.
+
+## Conclusion
+
+**Nothing beats persistence on this panel, and the ceiling says nothing will.**
+
+Measured over 150 users x 43 months:
+
+| | |
+|---|---|
+| lag-1 correlation of the change with its own last change | **0.002** |
+| variance of the change explained by per-user mean drift, *in-sample* | **2.4%** |
+| variance explained by month effects, *in-sample* | **1.2%** |
+| holdout persistence | WAPE **13.02**, `r2_change` **−0.009** |
+
+That 2.4% is the ceiling, and it is in-sample. Nothing tested cleared it:
+not the v1 dollar features, not the v2 ratios, not their union, not `change` /
+`scaled_change` / `signed_log_change`, not absolute / squared / pseudo-huber
+loss. Blending the booster toward zero makes WAPE monotonically worse. Per tier
+it loses to persistence everywhere (smb +4.3% MAE, mid +0.2%, ent +9.1%).
+
+Trimming whales at 3% brings the booster level with persistence but no further
+-- test MAE **17,595** against persistence's **17,591**, a 0.02% difference:
+
+| model | train_mae | test_mae | gap | test_wape | r2_change | skill |
+|---|---|---|---|---|---|---|
+| persistence | 6,865 | **17,591** | 2.56 | **12.544** | -0.011 | ref |
+| xgboost_change | 6,489 | 17,595 | 2.71 | 12.547 | -0.006 | +0.003 |
+| three_month_average | 8,485 | 31,111 | 3.67 | 22.185 | -4.641 | -1.362 |
+| ridge_change | 11,091 | 35,067 | 3.16 | 25.006 | -1.820 | -0.670 |
+
+With the randomised search **switched off** -- fixed defaults, 300 rounds,
+depth 4 -- the same trim pushes `r2_change` to **+0.026**, the only positive
+value anything in this project has produced. The configured search gives
+**-0.006**. The search is picking a worse model on the honest metric: it ranks
+candidates on `r2` over the dollar change (whale-dominated squared error) and
+early stopping then cuts the booster to **6 rounds**. See defect 3 below, and
+do not read the `+0.026` as a pipeline result.
+
+v2 also went backwards where it replaced rather than augmented: it dropped
+`roll3_mean_net_flow_usd` and `prev_1m_net_flow_usd` — the top two features by
+both ridge coefficient and xgboost gain in v1 — and its CV r² fell from 0.045 to
+0.028. Ridge on v2 is worse than the baseline it is supposed to beat.
+
+**The signal is not in this table.** Further tuning or feature engineering on
+monthly aggregates is very unlikely to pay. The direction worth funding is new
+information: within-month transaction timing, recurring-payment and salary
+detection, calendars of known scheduled inflows. "No model beats persistence"
+is a legitimate, well-evidenced result and should be reported as the headline.
+
+## Known defects
+
+- `ridge` with `scaled_change` or `signed_log_change` explodes (WAPE 2.3e3 and
+  3.8e6). The inverse transforms are unstable; both modes are unusable as written.
+- `reg:pseudohubererror` predicts a **literal constant** — `huber_slope`
+  defaults to 1 on a dollar-scale target, so the gradient saturates immediately.
+  It appears to win benchmarks because it has rediscovered persistence.
+- `models[].search.scoring: r2` in the config contradicts
+  `tuning.DEFAULT_SCORING = "neg_median_absolute_error"` and its stated
+  reasoning, and searches on squared error while fitting `reg:absoluteerror`.
+  **Not cosmetic:** the search plus early stopping settles on 4-6 trees and
+  scores `r2_change` -0.006 where untuned defaults score +0.026.
 
 ## Layout
 
 ```
-config/ml_config.yaml        every tunable setting -- experiments are config edits
-src/config/config.py         loads the YAML and the environment
-src/data/db_link.py          database engine + loading a query into a DataFrame
-src/data/data.py             the feature table, typed, validated and role-labelled
-src/features.py              derived ratios, momentum and calendar flags
-src/window.py                month-wise holdout and expanding-window CV folds
-src/metrics.py               scoring, and the two framings it has to be read in
-src/evaluate.py              the report: breakdowns by month, user and account tier
-src/tuning.py                the randomised search and the folds it runs over
-src/models_code/base_class.py    the interface every model implements, and save/load
-src/models_code/entity_scaler.py per-entity robust scale for the scaled target
-src/models_code/baseline.py      the trivial predictors: 3-month average, persistence
-src/models_code/mlr.py           ridge regression, level and change target modes
-src/models_code/xgboost_model.py boosted trees, deliberately small
-src/features_selection.py    four-stage selection, on train only, with a noise test
-src/train.py                 fit every model on the training region and save it
-src/test.py                  score the saved models on months none of them has seen
-notebooks/                   local exploration
-models/                      one .joblib per model, overwritten each run (gitignored)
+config/ml_config.yaml             every tunable setting
+pipeline.py                       run everything, print train vs test
+src/data/data.py                  the feature table + the whale trim
+src/data/db_link.py               engine + query to DataFrame (read-only)
+src/feature_engineering_v2/       the v2 ratio features
+src/window.py                     holdout and expanding-window CV folds
+src/metrics.py                    scoring, and the two framings to read it in
+src/evaluate.py                   breakdowns by month, user and account tier
+src/tuning.py                     randomised search and its folds
+src/importance.py                 gain and coefficient rankings
+src/models_code/base_class.py     the model interface, save/load, target modes
+src/models_code/entity_scaler.py  per-entity robust scale
+src/models_code/baseline.py       persistence (n_months 1), 3-month average
+src/models_code/ridge_reg.py      ridge, level and change target modes
+src/models_code/xgboost_model.py  boosted trees, deliberately small
+src/train.py / src/test.py        fit + save / score on unseen months
+notebooks/                        local exploration only
+models/                           one .joblib per model (gitignored)
 ```
-
-
-## The three entry points
-
-Run in this order. They are separate on purpose: choosing the columns, fitting
-the models and reporting the headline number are different questions, and a
-script that does two of them lets the second one's score quietly pick the
-first one's answer.
-
-```bash
-python -m src.features_selection   # which columns -- gain ranking + parsimony sweep
-python -m src.train                # fit + save   -- CV inside the training region
-python -m src.test                 # the answer   -- one table, all models compared
-```
-
-or in the container:
-
-```bash
-docker compose run --rm train
-docker compose run --rm test
-```
-
-**Selection never edits the config.** It prints the set it chose as a
-`features:` block to paste into `config/ml_config.yaml`, so narrowing the
-feature table stays a reviewed edit with its measurement beside it. Training
-reads that block; it does not re-select. Two runs over the same data therefore
-use the same columns, and the booster gets no extra attempts at the folds that
-the baseline never got.
-
-**Training never reads the holdout.** It cuts it off in the first few lines and
-works only on the training region from there.
-
-**Testing never recomputes the split.** Each saved model carries the months it
-was fitted on, and `src/test.py` scores everything strictly after the last of
-them. Editing `split.test_months` between the two runs moves nothing: the
-models still say where they stopped. This is the one thing the structure is
-built around, because the alternative -- both scripts deriving "the last N
-months" from config -- fails silently in both directions, by scoring a model on
-months it trained on, or by sliding the boundary back into the training region
-when new data lands.
-
-
-## Reading the comparison
-
-`src/test.py` prints one row per configured model, ranked by the configured
-`headline_metric`:
-
-```
-model                       rmse        mae  median_ae   wape  r2_change  skill
-xgboost_scaled            30,112     21,004      9,880  0.061      0.194  0.212
-ridge_change             190,455    140,223     78,110  0.402      0.041  0.043
-three_month_average      180,900    138,004     74,551  0.398      0.000    NaN
-```
-
-Three things to read, in this order:
-
-- **`skill`** is measured against `three_month_average`. Positive means better
-  than doing nothing clever. This is the column that says whether a model
-  earned its complexity.
-- **`r2_change`**, never `r2_level`. Scored against the movement. Every model
-  here clears 0.8 on the *level*, the 3-month average included, because the
-  level barely moves -- quoting that number would make the trivial baseline
-  look excellent.
-- **the gap between the baseline row and the others.** A model that does not
-  clearly separate from the top row has not been shown to work.
-
-The baseline is not a competitor with a handicap. It averages three raw balance
-lags and reads no selected features at all, which is what makes it a floor. The
-ridge and the booster are given the identical frozen feature set, so the gap
-between them is the model and not the columns.
-
-
-## What is predicted, and on what scale
-
-The target is `target_closing_balance_usd`, a monthly closing balance. Three
-quarters of these balances are negative -- they are liability accounts -- and
-they span three orders of magnitude, which is the fact that shapes everything
-below.
-
-Models do not fit the balance directly. `target_mode` picks the axis:
-
-| mode | fits | notes |
-|---|---|---|
-| `level` | the balance | almost entirely last month's balance; little left to learn |
-| `change` | the movement, in dollars | honest, but a dollar of error on a small account and on a whale count the same |
-| `scaled_change` | movement / that user's own typical movement | the default |
-| `signed_log_change` | movement in `sign(x)·log1p(\|x\|)` space | the log framing, made usable on a target that goes negative |
-
-`scaled_change` divides each movement by a robust per-entity scale (MAD, in
-`src/models_code/entity_scaler.py`). That scale is **fitted inside `_fit`**, on
-the rows the model was handed, and refitted for every CV fold -- computing it in
-`build_dataset` would estimate it over the holdout too. Predictions are
-multiplied back and the anchor added, so every mode is scored in dollars and
-the results table stays one table.
-
-XGBoost's objective is set explicitly to `reg:absoluteerror`. It was previously
-unset, which meant the library default `reg:squarederror` -- quadratic weighting
-on a panel where a handful of accounts move by six figures.
-
-## Features
-
-All 21 source columns arrive from `feature_store_monthly` and 18 of them are
-absolute dollar amounts, which teach a model account size rather than account
-behaviour. `src/features.py` derives ratios, momentum, spending shares,
-transaction-frequency features and calendar flags from them, and the raw dollar
-columns are then dropped in `data.drop_columns`.
-
-Every function there is row-wise over already-lagged inputs -- no `shift`, no
-`rolling`, no groupby along time -- so a feature for month t uses only what
-existed on day one of month t, which is what `split.gap_months: 0` relies on.
-
-## How a feature set is chosen
-
-Four stages, training months only, in `src/features_selection.py`:
-
-1. **Redundancy.** Cluster columns correlated at or above
-   `redundancy_threshold` under either Pearson or Spearman, keep one per
-   cluster -- the member with the highest rank correlation against the
-   *movement*. Run before ranking, because gain splits the credit between two
-   near-identical columns and leaves both looking mediocre.
-2. **Temporal cross-validation.** Rank by `gain` -- never `weight` or `cover`;
-   gain is the loss actually reduced by the splits a column appears in, so it
-   sees interactions a correlation cannot. Then take the top k for every k,
-   cross-validate each on the expanding folds, and keep the smallest k still
-   within `tolerance` of the full-feature model.
-3. **Out-of-fold stability.** Permutation importance computed on each fold's
-   *held-out* months, never on training rows. A feature is kept only if its
-   mean importance is positive and its coefficient of variation across folds is
-   at most `stability_max_cv`. Gain is a training statistic and a column
-   memorising noise scores well on it; this is the check that does not.
-4. **Noise test.** Re-run the whole thing against a shuffled target and require
-   that nothing is selected.
-
-R squared validates in stage 2, it does not select: candidate sets come from the
-gain ranking, which never reads a score. Selecting on whatever raises R squared
-is a wrapper method, and a wrapper method run to convergence fits the folds
-rather than the problem.
-
-### The gate, and why stage 4 needs it
-
-The tolerance rule in stage 2 is purely relative -- it returns the smallest k
-within `tolerance` of the full set. If the full set is worthless then every k
-matches it, every k passes, and k=1 is returned looking like a finding. So
-`min_signal` is checked first: the full-feature model must clear that much
-cross-validated `r2_change` before any set is returned at all. Zero is a real
-threshold for that metric, not an arbitrary one -- `r2_change = 0` is exactly
-the accuracy of predicting that the balance does not move.
-
-Without the gate the noise test cannot fail, and a test that cannot fail is not
-a test.
-
-### The noise test shuffles the movement, not the level
-
-`shuffle_target` permutes `target - anchor` and rebuilds `target = anchor +
-shuffled_movement`, leaving every anchor in place.
-
-Permuting the target column outright -- the obvious first implementation -- is
-wrong, and wrong in a way worth recording. It breaks the pairing between a row's
-target and its own anchor, so the movement becomes `other_row_balance -
-my_anchor`, whose variance is dominated by the anchor; a model then scores well
-on `r2_change` just by tracking the anchor. Measured here it reached +0.253 on
-shuffled data against +0.076 on the real thing. A noise run that beats the
-genuine one is a broken shuffle, not a leak.
-
-## Metrics
-
-`wape` -- total absolute error over total absolute truth -- is the headline.
-MAPE divides each row by its own truth and these balances pass through zero, so
-it needs a floor and a coverage figure to be quotable at all. RMSE ranks models
-by how well they fit the largest handful of accounts; `median_ae`, the previous
-default, is blind to the tail entirely.
-
-Every report also breaks down by **account-size tier** (`smb` / `mid` /
-`enterprise`, cut at `evaluation.tier_quantiles` on training rows only). A good
-global number on a panel this skewed can be a good number on the whales and a
-bad one on everybody else, and only the tier table shows which.
 
 ## Resources
 
-The following resources were consulted during this task:
 - https://machinelearningmastery.com/feature-selection-with-real-and-categorical-data/
-- https://medium.com/@mouadenna/time-series-splitting-techniques-ensuring-accurate-model-validation-5a3146db3088
+- https://medium.com/@mouadenna time-series-splitting-techniques-ensuring-accurate-model-validation-5a3146db3088
+- https://machinelearningmastery.com/feature-selection-with-real-and-categorical-data/
+- https://zams.com/blog/introducing-wape
+- https://towardsdatascience.com/how-to-forecast-time-series-using-lags-5876e3f7f473/

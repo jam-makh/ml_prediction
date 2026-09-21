@@ -1,0 +1,16 @@
+{
+  "model": "xgboost_change",
+  "trained_through": "2024-11",
+  "saved_at": "2026-09-18T16:41:03",
+  "search_scoring": "r2",
+  "search_cv_score": 0.045348455452789684,
+  "n_estimators": 4,
+  "best_params": {
+    "colsample_bytree": 0.6478376983753207,
+    "learning_rate": 0.08471354625326555,
+    "max_depth": 3,
+    "min_child_weight": 1,
+    "reg_lambda": 1.3260331922696553,
+    "subsample": 0.9083868719818244
+  }
+}

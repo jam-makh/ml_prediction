@@ -28,12 +28,12 @@ from typing import Any
 import numpy as np
 import numpy.typing as npt
 import pandas as pd
+from loguru import logger
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy.engine import Engine
 
 from src.config.config import load_config
 from src.data.db_link import load_dataframe
-from src.features import add_derived_features
 
 # Pandas period alias for a calendar month. Month values are normalised through
 # it to the first of the month: the feature table already stores them that way,
@@ -494,14 +494,263 @@ def load_feature_frame(
         The query result, untouched.
     """
     settings = config if config is not None else load_config()
-    query = str(settings["data"]["query"])
-    return load_dataframe(query, engine=engine)
+    return load_dataframe(resolve_query(settings["data"]), engine=engine)
+
+
+def resolve_table(data_settings: dict[str, Any], table: str | None = None) -> str:
+    """Return the source table name a run should read.
+
+    ``data.tables`` names each candidate table and ``data.active_table`` picks
+    one, so switching which panel the models are trained and tested on is a
+    one-word edit and both table names stay in git rather than one of them
+    living in an editor's undo history.
+
+    Parameters
+    ----------
+    data_settings : dict
+        The ``data`` block of the parsed config.
+    table : str, optional
+        A key of ``data.tables``, or a raw table name. Defaults to
+        ``data.active_table``.
+
+    Returns
+    -------
+    str
+        The table name to query.
+
+    Raises
+    ------
+    KeyError
+        If neither ``data.tables`` nor ``data.table`` is configured, or if the
+        requested key is not among them.
+    """
+    tables = data_settings.get("tables") or {}
+    wanted = table or data_settings.get("active_table") or data_settings.get("table")
+
+    if not tables:
+        if wanted:
+            return str(wanted)
+        raise KeyError("Config names no source table; set data.tables and data.active_table")
+
+    if wanted is None:
+        raise KeyError(
+            f"data.tables defines {sorted(tables)} but data.active_table does "
+            f"not say which to use"
+        )
+
+    wanted = str(wanted)
+    if wanted in tables:
+        return str(tables[wanted])
+    if wanted in set(map(str, tables.values())):
+        return wanted
+    raise KeyError(
+        f"No table named {wanted!r}; data.tables defines {sorted(tables)}"
+    )
+
+
+def resolve_query(data_settings: dict[str, Any], table: str | None = None) -> str:
+    """Return the SQL to run against the source database.
+
+    Parameters
+    ----------
+    data_settings : dict
+        The ``data`` block of the parsed config.
+    table : str, optional
+        Overrides ``data.active_table``. See :func:`resolve_table`.
+
+    Returns
+    -------
+    str
+        ``data.query`` verbatim when one is configured, otherwise a select over
+        the active table.
+
+    Notes
+    -----
+    ``SELECT *`` rather than a column list, deliberately: the feature set is
+    decided in ``data.drop_columns`` and the table is allowed to grow a column
+    without a code change. The name is quoted because it comes from a config
+    file the project owns, not from user input -- the quoting is here so a
+    table name with a capital letter survives PostgreSQL's case folding, not as
+    an injection guard.
+    """
+    explicit = data_settings.get("query")
+    if explicit and table is None:
+        return str(explicit)
+    return f'SELECT * FROM "{resolve_table(data_settings, table)}"'
+
+
+def resolve_drop_columns(
+    data_settings: dict[str, Any], drop_columns_for: str | None = None
+) -> tuple[str, ...]:
+    """Return the drop list one model family should use.
+
+    ``data.drop_columns`` in the config is a mapping of family name to list --
+    ``regression`` and ``xgboost`` today -- because the two fail differently on
+    the same column: a booster ignores a redundant feature, while Ridge splits
+    the weight arbitrarily across a collinear group and its coefficients stop
+    meaning anything. The lists are the disagreement written down.
+
+    A flat list is still accepted and used for every model, so an older config
+    keeps working.
+
+    Parameters
+    ----------
+    data_settings : dict
+        The ``data`` block of the parsed config.
+    drop_columns_for : str, optional
+        Which named list to read. Defaults to ``data.default_drop_columns``,
+        and then to the only list present when there is exactly one.
+
+    Returns
+    -------
+    tuple of str
+        Column names to exclude from the feature set. Empty when the config
+        names no drop columns at all.
+
+    Raises
+    ------
+    KeyError
+        If a name is asked for that the mapping does not have. Raised rather
+        than falling back to an empty list, because a typo that silently
+        selected *every* column -- including the raw balance lags the size
+        filter exists to hide -- would train a model on account size and still
+        report a number.
+    """
+    configured = data_settings.get("drop_columns") or ()
+
+    if not isinstance(configured, dict):
+        return tuple(str(name) for name in configured)
+
+    wanted = drop_columns_for or data_settings.get("default_drop_columns")
+    if wanted is None:
+        if len(configured) != 1:
+            raise KeyError(
+                f"data.drop_columns has {len(configured)} lists "
+                f"({sorted(configured)}) and no data.default_drop_columns to "
+                f"choose between them; pass drop_columns_for explicitly"
+            )
+        (wanted,) = configured
+
+    wanted = str(wanted)
+    if wanted not in configured:
+        raise KeyError(
+            f"No drop_columns list named {wanted!r}; the config defines "
+            f"{sorted(configured)}"
+        )
+    return tuple(str(name) for name in configured[wanted] or ())
+
+
+def trim_whale_entities(
+    frame: pd.DataFrame,
+    id_column: str,
+    time_column: str,
+    size_column: str,
+    share: float,
+    test_months: int,
+    gap_months: int = 0,
+) -> pd.DataFrame:
+    """Drop the largest ``share`` of entities, ranked by account size.
+
+    The panel's error is not spread evenly across users: on the holdout the
+    top decile of accounts carries a multiple of the median account's dollar
+    error, and both the squared loss and RMSE are decided almost entirely by
+    them. Dropping them is a statement about which population is being served,
+    not a cleaning step -- the numbers that come out afterwards describe a
+    different and smaller problem, and are not comparable with the numbers from
+    the full panel.
+
+    Two choices here matter.
+
+    **Entities, not rows.** Trimming the largest *rows* would cut particular
+    months out of a user's history, which puts a hole in exactly the lag and
+    rolling features the whole table is built from, and -- worse -- selects
+    those rows using the target. A user is either in the population or is not.
+
+    **Ranked on training months only.** The ranking reads the anchor column
+    over the months before the holdout cut, so which users are dropped cannot
+    depend on anything inside the held-out window. Account size is stable
+    enough here that ranking over the full panel would pick nearly the same
+    users, which is precisely why it would be easy to leak by accident and not
+    notice.
+
+    Parameters
+    ----------
+    frame : pandas.DataFrame
+        Rows, after the target and month filters.
+    id_column, time_column : str
+        Entity and month column names.
+    size_column : str
+        Column standing in for account size, normally the anchor
+        (last month's closing balance). Ranked by each entity's median
+        absolute value.
+    share : float
+        Share of entities to drop, between 0 and 1. 0.05 drops the largest 5%.
+    test_months : int
+        Length of the holdout, so the ranking can avoid it.
+    gap_months : int, optional
+        Months discarded between train and test. Default 0.
+
+    Returns
+    -------
+    pandas.DataFrame
+        ``frame`` without the dropped entities' rows. Returned unchanged when
+        ``share`` is 0.
+
+    Raises
+    ------
+    ValueError
+        If ``share`` is not in [0, 1), or if the trim would empty the panel.
+    """
+    if not share:
+        return frame
+    if not 0 <= share < 1:
+        raise ValueError(
+            f"data.trim_top_entities must be in [0, 1), got {share!r}"
+        )
+    if size_column not in frame.columns:
+        raise KeyError(
+            f"data.trim_top_entities ranks on {size_column!r}, which is not in "
+            f"the table"
+        )
+
+    # Imported here rather than at module scope: src.window imports Dataset
+    # from this module, so a top-level import would be circular.
+    from src.window import plan_month_cut
+
+    months = pd.DatetimeIndex(sorted(frame[time_column].unique()))
+    train_months, _ = plan_month_cut(months, test_months, gap_months)
+    seen = frame.loc[frame[time_column].isin(train_months)]
+
+    size = seen.groupby(id_column)[size_column].apply(lambda col: col.abs().median())
+    # Entities with no usable size in the training region sort last and are
+    # kept: a missing measurement is not evidence of being a whale.
+    size = size.dropna().sort_values(ascending=False)
+
+    n_drop = int(np.floor(len(size) * share))
+    if n_drop == 0:
+        return frame
+
+    dropped = set(size.index[:n_drop])
+    kept = frame.loc[~frame[id_column].isin(dropped)]
+    if kept.empty:
+        raise ValueError(
+            f"data.trim_top_entities of {share} removed every row"
+        )
+    logger.info(
+        f"Trimmed   : {n_drop} of {len(size)} users "
+        f"({100 * n_drop / len(size):.1f}%) as whales, ranked on median "
+        f"|{size_column}| over {len(train_months)} training months; "
+        f"{len(frame) - len(kept):,} rows dropped"
+    )
+    return kept
 
 
 def build_dataset(
     config: dict[str, Any] | None = None,
     engine: Engine | None = None,
     frame: pd.DataFrame | None = None,
+    drop_columns_for: str | None = None,
+    table: str | None = None,
 ) -> Dataset:
     """Load, coerce, validate and sort the feature table into a ``Dataset``.
 
@@ -517,6 +766,13 @@ def build_dataset(
     frame : pandas.DataFrame, optional
         An already-loaded frame to use instead of querying. Lets the notebook
         re-run the checks on a subset without a second round trip.
+    drop_columns_for : str, optional
+        Which named list under ``data.drop_columns`` decides the feature set --
+        ``regression`` or ``xgboost``. Defaults to
+        ``data.default_drop_columns``. See :func:`resolve_drop_columns`.
+    table : str, optional
+        Which entry of ``data.tables`` to read. Defaults to
+        ``data.active_table``. Ignored when ``frame`` is supplied.
 
     Returns
     -------
@@ -537,7 +793,11 @@ def build_dataset(
     target_column = str(data_settings["target_column"])
     id_column = str(data_settings["id_column"])
     time_column = str(data_settings["time_column"])
-    drop_columns = tuple(str(name) for name in data_settings.get("drop_columns") or ())
+    drop_columns = resolve_drop_columns(data_settings, drop_columns_for)
+    renames = {
+        str(old): str(new)
+        for old, new in (data_settings.get("rename_columns") or {}).items()
+    }
     # The frozen feature set, top level in the config rather than under `data`
     # because it is an output of feature selection rather than a property of
     # the source table. Empty or absent means "derive by exclusion".
@@ -547,7 +807,24 @@ def build_dataset(
         for month in data_settings.get("exclude_months") or ()
     )
 
-    raw = frame if frame is not None else load_feature_frame(settings, engine=engine)
+    if frame is not None:
+        raw = frame
+    else:
+        raw = load_dataframe(resolve_query(data_settings, table), engine=engine)
+
+    # Source renames, applied before anything else reads the frame so that every
+    # later error message names the column the config names. Only renames whose
+    # source column is actually present, so re-running over an already-renamed
+    # frame -- which the notebook does -- is a no-op rather than an error.
+    active = {old: new for old, new in renames.items() if old in raw.columns}
+    if active:
+        collisions = [new for new in active.values() if new in raw.columns]
+        if collisions:
+            raise ValueError(
+                f"data.rename_columns would create duplicate column(s) "
+                f"{collisions}; the target name is already in the table"
+            )
+        raw = raw.rename(columns=active)
 
     # Validate before coercing, so a missing column is reported as a missing
     # column rather than as a conversion failure on a column that is not there.
@@ -571,22 +848,32 @@ def build_dataset(
                 f"data.exclude_months removed every row; excluded {list(exclude_months)}"
             )
 
+    # The whale trim. After the month filters so the ranking sees the same
+    # months everything else does, and before the sort so the sort is done once
+    # on the surviving rows. Reads `split` as well as `data`, because which
+    # months count as training is a property of the split and duplicating the
+    # cut here is how the two drift apart.
+    trim_share = float(data_settings.get("trim_top_entities") or 0.0)
+    if trim_share:
+        split_settings = settings.get("split") or {}
+        typed = trim_whale_entities(
+            typed,
+            id_column=id_column,
+            time_column=time_column,
+            size_column=str(
+                (settings.get("evaluation") or {}).get(
+                    "anchor_column", "prev_1m_closing_balance_usd"
+                )
+            ),
+            share=trim_share,
+            test_months=int(split_settings.get("test_months", 8)),
+            gap_months=int(split_settings.get("gap_months", 0)),
+        )
+
     # Sorted by entity then time: every downstream check that reasons about
     # "the previous month" assumes this order, and sorting once here is cheaper
     # than defending against it in each of them.
     ordered = typed.sort_values([id_column, time_column]).reset_index(drop=True)
-
-    # Ratios, momentum, spending shares and calendar flags, built from the
-    # columns already present. This is where the size bias is taken out: the
-    # table arrives as mostly absolute dollar amounts, which tell a model how
-    # big an account is rather than what it is doing.
-    #
-    # Added here, before the feature list is resolved, so a derived column is an
-    # ordinary column from that point on -- picked up automatically, excludable
-    # through drop_columns, visible to feature selection, and saved with the
-    # model. Every function in src/features.py is row-wise over already-lagged
-    # inputs, so this cannot introduce a look-ahead; see the module docstring.
-    ordered = add_derived_features(ordered, time_column=time_column)
 
     features = resolve_feature_columns(
         ordered,

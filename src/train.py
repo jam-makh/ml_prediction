@@ -50,6 +50,7 @@ then score what it saved::
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -57,21 +58,30 @@ from typing import Any
 import numpy as np
 import numpy.typing as npt
 import pandas as pd
+from loguru import logger
 from pydantic import BaseModel, ConfigDict, Field
 
+from src.log import setup_logging
 from src.config.config import load_config, resolve_output_dir
 from src.data.data import (
     Dataset,
     build_dataset,
+    resolve_drop_columns,
     suspicious_months,
     unchanged_share_by_month,
 )
-from src.evaluate import EvaluationSettings
+from src.evaluate import (
+    AMOUNT_COLUMNS,
+    MOVEMENT_COLUMNS,
+    EvaluationSettings,
+    results_table,
+)
 from src.metrics import Scores, anchor_values, score
 from src.models_code.base_class import Model, ModelFactory
 from src.models_code.baseline import LagAverageBaseline
-from src.models_code.mlr import RidgeRegression
+from src.models_code.ridge_reg import RidgeRegression
 from src.models_code.xgboost_model import XGBoostModel
+from src.tuning import DEFAULT_SCORING
 from src.window import (
     Split,
     SplitSettings,
@@ -99,6 +109,16 @@ MODEL_REGISTRY: dict[str, Callable[..., Model]] = {
 # greppable, and the alternative was inspecting every constructor's signature at
 # runtime to find out what it would tolerate.
 RUN_DEFAULTS = ("random_state", "anchor_column")
+
+# Which `data.drop_columns` list each model kind reads. Before this existed the
+# dataset was built once with `default_drop_columns`, so every model got the
+# same list: dropping a column "for xgboost" silently dropped it for ridge too,
+# and the ridge list was never read at all.
+FAMILY_BY_KIND: dict[str, str] = {
+    "lag_average": "mean",
+    "ridge": "ridge_regression",
+    "xgboost": "xgboost",
+}
 
 
 def model_path(output_dir: Path, name: str) -> Path:
@@ -260,6 +280,46 @@ def fit_and_predict(
     return model, model.predict(test)
 
 
+def dataset_for(
+    spec: ModelSpec, dataset: Dataset, data_settings: dict[str, Any] | None
+) -> Dataset:
+    """Return ``dataset`` with the feature list this model's family should see.
+
+    Only narrows: the columns come from the dataset's own feature list minus
+    the family's ``data.drop_columns`` entry, so the base dataset has to be
+    built with the widest list (``default_drop_columns`` pointing at an empty
+    one). The frame itself is untouched, and a fitted model predicts on the
+    columns it recorded at fit time, so scoring code can keep passing the
+    base dataset.
+
+    Parameters
+    ----------
+    spec : ModelSpec
+        The model about to be fitted.
+    dataset : Dataset
+        The base dataset.
+    data_settings : dict or None
+        The config's ``data`` block. None returns ``dataset`` unchanged.
+
+    Returns
+    -------
+    Dataset
+        Same rows, narrowed ``feature_columns``.
+
+    Raises
+    ------
+    ValueError
+        If the drop list removes every feature.
+    """
+    if not data_settings:
+        return dataset
+    dropped = set(resolve_drop_columns(data_settings, FAMILY_BY_KIND.get(spec.kind)))
+    columns = tuple(name for name in dataset.feature_columns if name not in dropped)
+    if not columns:
+        raise ValueError(f"{spec.name}: data.drop_columns removed every feature")
+    return dataset.model_copy(update={"feature_columns": columns})
+
+
 def score_predictions(
     predictions: dict[str, npt.NDArray[np.float64]],
     test: Dataset,
@@ -308,6 +368,7 @@ def fit_fold(
     dataset: Dataset,
     split: Split,
     defaults: dict[str, Any] | None = None,
+    data_settings: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Model], dict[str, npt.NDArray[np.float64]]]:
     """Fit every model on one fold and predict its validation rows.
 
@@ -321,6 +382,9 @@ def fit_fold(
         The fit and validate rows. Already checked for leak when it was built.
     defaults : dict, optional
         Run-wide constructor values, handed to each model as it is built.
+    data_settings : dict, optional
+        The config's ``data`` block, for each family's drop list. See
+        ``dataset_for``.
 
     Returns
     -------
@@ -335,7 +399,9 @@ def fit_fold(
     predictions: dict[str, npt.NDArray[np.float64]] = {}
     for spec in specs:
         model, prediction = fit_and_predict(
-            spec.factory(defaults), fit_rows, validate_rows
+            spec.factory(defaults),
+            dataset_for(spec, fit_rows, data_settings),
+            validate_rows,
         )
         models[spec.name] = model
         predictions[spec.name] = prediction
@@ -349,6 +415,7 @@ def cross_validate(
     folds: list[Split],
     settings: EvaluationSettings,
     defaults: dict[str, Any] | None = None,
+    data_settings: dict[str, Any] | None = None,
 ) -> pd.DataFrame:
     """Score every model on every expanding-window fold.
 
@@ -368,16 +435,19 @@ def cross_validate(
         anything a model learns -- an imputer, a scaler, a chosen alpha, a
         searched parameter set -- is refitted inside each fold rather than
         carried across them.
+    data_settings : dict, optional
+        The config's ``data`` block, for each family's drop list.
 
     Returns
     -------
     pandas.DataFrame
-        One row per (fold, model), with the RMSE, the honest R squared and the
-        skill score. Empty when no folds were produced.
+        One row per (fold, model), with the fields behind both results tables
+        (``AMOUNT_COLUMNS`` and ``MOVEMENT_COLUMNS``). Empty when no folds
+        were produced.
     """
     rows: list[dict[str, Any]] = []
     for fold in folds:
-        _, predictions = fit_fold(specs, train, fold, defaults)
+        _, predictions = fit_fold(specs, train, fold, defaults, data_settings)
         scored = score_predictions(
             predictions, train.take(fold.test_positions), settings
         )
@@ -388,47 +458,79 @@ def cross_validate(
                     "test_months": f"{fold.test_months[0]:%Y-%m}"
                     f"..{fold.test_months[-1]:%Y-%m}",
                     "model": model_name,
-                    "rmse": scores.rmse,
-                    "mae": scores.mae,
-                    "smape": scores.smape,
-                    "r2_change": scores.r2_change,
-                    "skill": scores.skill,
+                    **{
+                        field: getattr(scores, field)
+                        for field in (*AMOUNT_COLUMNS, *MOVEMENT_COLUMNS)
+                    },
                 }
             )
     return pd.DataFrame(rows)
 
 
-def summarise_folds(fold_scores: pd.DataFrame) -> pd.DataFrame:
+def summarise_folds(
+    fold_scores: pd.DataFrame, columns: dict[str, str], sort_by: str = "wape"
+) -> pd.DataFrame:
     """Average each model's fold scores into one row per model.
 
     Parameters
     ----------
     fold_scores : pandas.DataFrame
         Output of ``cross_validate``.
+    columns : dict of str to str
+        ``AMOUNT_COLUMNS`` or ``MOVEMENT_COLUMNS``.
+    sort_by : str, optional
+        Column to rank on. Default ``wape``.
 
     Returns
     -------
     pandas.DataFrame
-        One row per model, with the mean and the spread across folds. The
-        spread is worth as much as the mean: a model that wins on average but
-        swings wildly between periods is not the safer choice.
+        One row per model: the fold mean of ``r2``, ``mae``, ``rmse`` and
+        ``wape``, plus ``wape_std`` across folds. The spread is worth as much
+        as the mean: a model that wins on average but swings wildly between
+        periods is not the safer choice.
     """
     if fold_scores.empty:
         return fold_scores
 
-    return (
-        fold_scores.groupby("model")
-        .agg(
-            folds=("fold", "count"),
-            rmse_mean=("rmse", "mean"),
-            rmse_std=("rmse", "std"),
-            mae_mean=("mae", "mean"),
-            smape_mean=("smape", "mean"),
-            r2_change_mean=("r2_change", "mean"),
-            skill_mean=("skill", "mean"),
-        )
-        .sort_values("rmse_mean")
-    )
+    grouped = fold_scores.groupby("model")
+    table = results_table(grouped[list(columns)].mean(), columns, sort_by=sort_by)
+    wape_field = next(field for field, name in columns.items() if name == "wape")
+    table["wape_std"] = grouped[wape_field].std()
+    table["folds"] = grouped["fold"].count()
+    return table
+
+
+def save_best_params(model: XGBoostModel, output_dir: Path) -> Path:
+    """Write a tuned booster's winning parameters to a readable JSON file.
+
+    The same values are pickled inside the model; this copy is for reading and
+    for pasting into the config as fixed ``params`` once the search is settled.
+
+    Parameters
+    ----------
+    model : XGBoostModel
+        A fitted model whose search has run.
+    output_dir : pathlib.Path
+        Directory the models are saved to.
+
+    Returns
+    -------
+    pathlib.Path
+        ``<output_dir>/<model name>_best_params.json``, overwritten each run.
+    """
+    through = model.trained_through
+    record = {
+        "model": model.name,
+        "trained_through": f"{through:%Y-%m}" if through is not None else None,
+        "saved_at": pd.Timestamp.now().isoformat(timespec="seconds"),
+        "search_scoring": model.search.get("scoring", DEFAULT_SCORING),
+        "search_cv_score": model.search_cv_score_,
+        "n_estimators": model.best_iteration_,
+        "best_params": model.best_params_,
+    }
+    path = output_dir / f"{model.name}_best_params.json"
+    path.write_text(json.dumps(record, indent=2), encoding="utf-8")
+    return path
 
 
 def run(config: dict[str, Any] | None = None) -> dict[str, Model]:
@@ -458,18 +560,18 @@ def run(config: dict[str, Any] | None = None) -> dict[str, Model]:
     }
 
     dataset = build_dataset(settings)
-    print(f"Data      : {dataset.summary()}")
-    print(f"Split     : {split_settings.describe()}")
-    print(f"Models    : {', '.join(spec.name for spec in specs)}")
+    logger.info(f"Data      : {dataset.summary()}")
+    logger.info(f"Split     : {split_settings.describe()}")
+    logger.info(f"Models    : {', '.join(spec.name for spec in specs)}")
 
     frozen = settings.get("features") or []
     if frozen:
-        print(
+        logger.info(
             f"Features  : {len(frozen)} columns, frozen in the config's "
             f"`features` block"
         )
     else:
-        print(
+        logger.info(
             f"Features  : {len(dataset.feature_columns)} columns, derived by "
             f"exclusion (no `features` block; run src.features_selection to "
             f"freeze a set)"
@@ -483,9 +585,9 @@ def run(config: dict[str, Any] | None = None) -> dict[str, Model]:
     flagged = suspicious_months(dataset, evaluation.anchor_column)
     if len(flagged):
         shares = unchanged_share_by_month(dataset, evaluation.anchor_column)
-        print("\nWARNING: months where the target barely moves from last month:")
+        logger.warning("Months where the target barely moves from last month:")
         for month in flagged:
-            print(
+            logger.warning(
                 f"  {month:%Y-%m}: {100 * shares[month]:.0f}% of rows unchanged. "
                 f"Add it to data.exclude_months, or explain why it is real."
             )
@@ -497,9 +599,9 @@ def run(config: dict[str, Any] | None = None) -> dict[str, Model]:
         dataset, split_settings.test_months, split_settings.gap_months
     )
     train = dataset.take(holdout.train_positions)
-    print(f"Training  : {holdout.n_train:,} rows, {len(train.months)} months, "
+    logger.info(f"Training  : {holdout.n_train:,} rows, {len(train.months)} months, "
           f"{train.months[0]:%Y-%m}..{train.months[-1]:%Y-%m}")
-    print(f"Held out  : {holdout.n_test:,} rows from "
+    logger.info(f"Held out  : {holdout.n_test:,} rows from "
           f"{holdout.test_months[0]:%Y-%m} -- not read again in this script")
 
     folds = expanding_folds(
@@ -510,33 +612,48 @@ def run(config: dict[str, Any] | None = None) -> dict[str, Model]:
         min_train_months=split_settings.min_train_months,
     )
 
-    print(
+    logger.info(
         f"\n--- Cross-validation ({len(folds)} expanding folds inside the "
         f"training region)"
     )
-    fold_scores = cross_validate(specs, train, folds, evaluation, defaults)
+    fold_scores = cross_validate(
+        specs, train, folds, evaluation, defaults, data_block
+    )
     if fold_scores.empty:
-        print(
+        logger.info(
             "  No folds were produced. Check cv_folds and min_train_months "
             "against the number of training months."
         )
     else:
-        fold_summary = summarise_folds(fold_scores)
-        print(fold_summary.to_string(float_format=lambda value: f"{value:,.2f}"))
-        print(
+        for title, columns in (
+            ("Amounts: the balance itself", AMOUNT_COLUMNS),
+            ("Movements: change from last month's balance", MOVEMENT_COLUMNS),
+        ):
+            fold_summary = summarise_folds(
+                fold_scores, columns, sort_by=evaluation.headline_metric
+            )
+            logger.info(f"\n  {title} (mean over folds, sorted by "
+                  f"{evaluation.headline_metric})")
+            logger.info(fold_summary.to_string(float_format=lambda value: f"{value:,.3f}"))
+        logger.info(
             "\n  These are validation scores from inside the training region, "
             "for choosing between models.\n  The headline comparison is "
             "`python -m src.test`, on months no model here has seen."
         )
 
     # The final fit: every model, on the whole training region, once.
-    print("\n--- Fitting on the full training region")
+    logger.info("\n--- Fitting on the full training region")
     fitted: dict[str, Model] = {}
     for spec in specs:
         model = spec.factory(defaults)()
-        model.fit(train)
+        model.fit(dataset_for(spec, train, data_block))
         fitted[spec.name] = model
-        print(f"  {model.describe()}")
+        logger.info(f"  {model.describe()}")
+        dropped = [name for name in train.feature_columns if name not in model.feature_columns]
+        logger.info(
+            f"    {len(model.feature_columns)} features"
+            + (f", dropped {dropped}" if dropped else "")
+        )
 
     # What the search settled on. Printed rather than written to a summary
     # file: it is also pickled with the model, so the artefact can be asked
@@ -547,12 +664,12 @@ def run(config: dict[str, Any] | None = None) -> dict[str, Model]:
         if getattr(model, "best_params_", None) is not None
     }
     if tuned:
-        print("\n--- Tuning")
+        logger.info("\n--- Tuning")
         for name, model in tuned.items():
-            print(f"  {name}: {getattr(model, 'best_params_', None)}")
+            logger.info(f"  {name}: {getattr(model, 'best_params_', None)}")
             rounds = getattr(model, "best_iteration_", None)
             if rounds:
-                print(
+                logger.info(
                     f"    {rounds} rounds, the median of "
                     f"{getattr(model, 'stopping_rounds_', [])} across the "
                     f"early-stopping folds"
@@ -565,19 +682,22 @@ def run(config: dict[str, Any] | None = None) -> dict[str, Model]:
         importance = model.feature_importance()
         if importance is None:
             continue
-        print(f"\n--- {name}: feature importance ({importance.name}), top 12")
-        print(importance.head(12).to_string(float_format=lambda v: f"{v:,.4f}"))
+        logger.info(f"\n--- {name}: feature importance ({importance.name}), top 12")
+        logger.info(importance.head(12).to_string(float_format=lambda v: f"{v:,.4f}"))
 
     # Saved last, so nothing is written unless everything fitted. Each file is
     # the whole model: preprocessing, fitted statistics, the months it saw and
     # the columns it expects.
     output_dir = resolve_output_dir(settings)
-    print(f"\n--- Saved to {output_dir}")
+    logger.info(f"\n--- Saved to {output_dir}")
     for spec in specs:
         path = fitted[spec.name].save(model_path(output_dir, spec.name))
-        print(f"  {path.name}")
+        logger.info(f"  {path.name}")
+        model = fitted[spec.name]
+        if isinstance(model, XGBoostModel) and model.best_params_ is not None:
+            logger.info(f"  {save_best_params(model, output_dir).name}")
 
-    print("\nNow score them:  python -m src.test")
+    logger.info("\nNow score them:  python -m src.test")
     return fitted
 
 
@@ -588,7 +708,9 @@ def main() -> None:
     -------
     None
     """
-    run()
+    settings = load_config()
+    logger.info(f"Logging to {setup_logging(settings, run_name='train')}")
+    run(settings)
 
 
 if __name__ == "__main__":

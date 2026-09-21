@@ -136,6 +136,14 @@ class Scores(BaseModel):
     n_rows_change : int
         Rows ``r2_change`` used. Lower than ``n_rows`` because a user's first
         month has no previous balance to measure movement against.
+    mae_change, rmse_change : float
+        MAE and RMSE over the rows the change framing used. The same dollar
+        errors as ``mae`` and ``rmse``, so they differ only by the rows that
+        have no previous month.
+    wape_change : float
+        Total absolute error over total absolute movement, as a percentage.
+        Unlike MAE and RMSE this does change with the framing, because the
+        denominator is the movement rather than the balance.
     mape : float or None
         Mean absolute percentage error over rows above the floor, or None when
         no row qualified.
@@ -159,6 +167,9 @@ class Scores(BaseModel):
     r2_level: float
     r2_change: float = float("nan")
     n_rows_change: int = 0
+    mae_change: float = float("nan")
+    rmse_change: float = float("nan")
+    wape_change: float = float("nan")
     mape: float | None = None
     mape_coverage: float = 0.0
     skill: float | None = None
@@ -371,6 +382,7 @@ def score(
 
     r2_change = float("nan")
     n_rows_change = 0
+    mae_change = rmse_change = wape_change = float("nan")
     if anchor is not None:
         # Same errors, different denominator. The subtraction cancels out of
         # the numerator entirely, which is exactly why the dollar metrics above
@@ -381,6 +393,10 @@ def score(
         )
         r2_change = r_squared(movement, predicted_movement)
         n_rows_change = int(movement.size)
+        movement_errors = movement - predicted_movement
+        mae_change = float(np.mean(np.abs(movement_errors)))
+        rmse_change = float(np.sqrt(np.mean(np.square(movement_errors))))
+        wape_change = _wape(movement, predicted_movement)
 
     skill: float | None = None
     if reference_pred is not None:
@@ -402,6 +418,9 @@ def score(
         r2_level=r_squared(truth, prediction),
         r2_change=r2_change,
         n_rows_change=n_rows_change,
+        mae_change=mae_change,
+        rmse_change=rmse_change,
+        wape_change=wape_change,
         mape=mape,
         mape_coverage=coverage,
         skill=skill,

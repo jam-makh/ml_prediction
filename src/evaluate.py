@@ -54,6 +54,49 @@ WORST_N = 10
 # whose first month falls inside the holdout.
 TIER_ORDER: tuple[str, ...] = ("smb", "mid", "enterprise")
 
+# The two results tables every model is reported in. Same four columns in each,
+# mapped from the Scores field that feeds them. Amounts scores the balance
+# itself; movements scores the change from last month's balance, which is the
+# part actually being forecast.
+AMOUNT_COLUMNS: dict[str, str] = {
+    "r2_level": "r2",
+    "mae": "mae",
+    "rmse": "rmse",
+    "wape": "wape",
+}
+MOVEMENT_COLUMNS: dict[str, str] = {
+    "r2_change": "r2",
+    "mae_change": "mae",
+    "rmse_change": "rmse",
+    "wape_change": "wape",
+}
+
+
+def results_table(
+    scores: pd.DataFrame, columns: dict[str, str], sort_by: str = "wape"
+) -> pd.DataFrame:
+    """Cut one of the two results tables out of a wider score table.
+
+    Parameters
+    ----------
+    scores : pandas.DataFrame
+        One row per model, with Scores fields as columns.
+    columns : dict of str to str
+        ``AMOUNT_COLUMNS`` or ``MOVEMENT_COLUMNS``.
+    sort_by : str, optional
+        Column to rank on, after renaming. Default ``wape``. Falls back to
+        ``wape`` when the name is not one of the four.
+
+    Returns
+    -------
+    pandas.DataFrame
+        One row per model with ``r2``, ``mae``, ``rmse`` and ``wape``, best
+        first.
+    """
+    table = scores.loc[:, list(columns)].rename(columns=columns)
+    column = sort_by if sort_by in table.columns else "wape"
+    return table.sort_values(column)
+
 
 class EvaluationSettings(BaseModel):
     """The ``evaluation`` block of the config.
@@ -574,6 +617,9 @@ def report_table(reports: dict[str, EvaluationReport], sort_by: str = "median_ae
             "bias": report.bias,
             "r2_level": report.scores.r2_level,
             "r2_change": report.scores.r2_change,
+            "mae_change": report.scores.mae_change,
+            "rmse_change": report.scores.rmse_change,
+            "wape_change": report.scores.wape_change,
             "skill": report.scores.skill,
         }
         for name, report in reports.items()

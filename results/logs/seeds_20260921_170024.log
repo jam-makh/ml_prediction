@@ -1,0 +1,579 @@
+2026-09-21 17:00:24 | INFO    | __main__:11 | ##### SEED 1
+2026-09-21 17:00:24 | INFO    | pipeline:264 | 
+##############################################################################
+2026-09-21 17:00:24 | INFO    | pipeline:265 | #  TABLE: v1  (feature_store_monthly)
+2026-09-21 17:00:24 | INFO    | pipeline:266 | ##############################################################################
+2026-09-21 17:00:24 | INFO    | pipeline:187 | Training ...
+2026-09-21 17:00:24 | INFO    | src.train:563 | Data      : 6,300 rows, 150 entities, 42 months (2022-01 to 2025-06), 25 features
+2026-09-21 17:00:24 | INFO    | src.train:564 | Split     : holdout: last 7m; cv: 5 expanding folds of 3m, min train 6m
+2026-09-21 17:00:24 | INFO    | src.train:565 | Models    : persistence, three_month_average, ridge_change, xgboost_change
+2026-09-21 17:00:24 | INFO    | src.train:574 | Features  : 25 columns, derived by exclusion (no `features` block; run src.features_selection to freeze a set)
+2026-09-21 17:00:24 | INFO    | src.train:602 | Training  : 5,250 rows, 35 months, 2022-01..2024-11
+2026-09-21 17:00:24 | INFO    | src.train:604 | Held out  : 1,050 rows from 2024-12 -- not read again in this script
+2026-09-21 17:00:24 | INFO    | src.train:615 | 
+--- Cross-validation (5 expanding folds inside the training region)
+2026-09-21 17:00:29 | INFO    | src.train:635 | 
+  Amounts: the balance itself (mean over folds, sorted by wape)
+2026-09-21 17:00:30 | INFO    | src.train:637 |                        r2        mae       rmse   wape  wape_std  folds
+model                                                                  
+xgboost_change      0.664 11,498.048 60,624.777 21.904    12.099      5
+persistence         0.660 11,463.608 60,824.183 21.939    11.691      5
+ridge_change        0.644 12,730.408 61,810.756 24.782    13.775      5
+three_month_average 0.634 13,936.381 62,470.242 26.038    16.276      5
+2026-09-21 17:00:30 | INFO    | src.train:635 | 
+  Movements: change from last month's balance (mean over folds, sorted by wape)
+2026-09-21 17:00:30 | INFO    | src.train:637 |                         r2        mae       rmse    wape  wape_std  folds
+model                                                                    
+xgboost_change       0.022 11,498.048 60,624.777  98.903     2.461      5
+persistence         -0.010 11,463.608 60,824.183 100.000     0.000      5
+ridge_change        -0.007 12,730.408 61,810.756 113.319    10.598      5
+three_month_average -0.063 13,936.381 62,470.242 115.002    15.765      5
+2026-09-21 17:00:30 | INFO    | src.train:638 | 
+  These are validation scores from inside the training region, for choosing between models.
+  The headline comparison is `python -m src.test`, on months no model here has seen.
+2026-09-21 17:00:30 | INFO    | src.train:645 | 
+--- Fitting on the full training region
+2026-09-21 17:00:30 | INFO    | src.train:651 |   persistence: fitted on 35 months through 2024-11
+2026-09-21 17:00:30 | INFO    | src.train:653 |     25 features
+2026-09-21 17:00:30 | INFO    | src.train:651 |   three_month_average: fitted on 35 months through 2024-11
+2026-09-21 17:00:30 | INFO    | src.train:653 |     25 features
+2026-09-21 17:00:30 | WARNING | src.models_code.ridge_reg:166 |   ridge_change: alpha settled on 1e+06, the top of the grid -- cross-validation wants every coefficient at zero, so this model is predicting the mean movement and nothing else. Widening the grid will not change that; it is a finding about the features, not about alpha.
+2026-09-21 17:00:30 | INFO    | src.train:651 |   ridge_change: ridge alpha=1e+06, target=change, 25 features
+2026-09-21 17:00:30 | INFO    | src.train:653 |     25 features
+2026-09-21 17:00:31 | INFO    | src.train:651 |   xgboost_change: 300 trees, depth 4, lr 0.03, target=change, split on 18 of 18 features
+2026-09-21 17:00:31 | INFO    | src.train:653 |     18 features, dropped ['prev_1m_spend_groceries_usd', 'prev_1m_spend_dining_usd', 'prev_1m_spend_retail_usd', 'prev_1m_spend_cash_atm_usd', 'prev_1m_spend_transport_usd', 'prev_1m_spend_bills_usd', 'prev_1m_spend_other_usd']
+2026-09-21 17:00:31 | INFO    | src.train:667 | 
+--- Tuning
+2026-09-21 17:00:31 | INFO    | src.train:669 |   ridge_change: {'alpha': 1000000.0}
+2026-09-21 17:00:31 | INFO    | src.train:685 | 
+--- ridge_change: feature importance (abs_coefficient), top 12
+2026-09-21 17:00:31 | INFO    | src.train:686 | prev_1m_closing_balance_usd            24.2516
+roll3_mean_net_flow_usd                23.7578
+roll3_mean_closing_balance_usd         21.1664
+prev_2m_closing_balance_usd            18.9493
+prev_3m_closing_balance_usd            17.9724
+prev_1m_net_flow_usd                   17.8962
+delta_prev_1m_2m_closing_balance_usd   15.0987
+prev_1m_spend_cash_atm_usd              9.4518
+days_in_month                           8.7124
+prev_1m_distinct_merchants              5.7179
+roll3_mean_total_credited_usd           5.0583
+prev_1m_total_credited_usd              4.4794
+2026-09-21 17:00:31 | INFO    | src.train:685 | 
+--- xgboost_change: feature importance (gain), top 12
+2026-09-21 17:00:31 | INFO    | src.train:686 | prev_1m_distinct_merchants             358,745,248.0000
+roll3_mean_net_flow_usd                126,096,128.0000
+roll3_mean_total_debited_usd           123,427,952.0000
+prev_1m_txn_count                      119,750,080.0000
+prev_1m_total_debited_usd              100,607,064.0000
+roll3_std_closing_balance_usd           87,904,856.0000
+prev_1m_total_spend_usd                 82,979,184.0000
+prev_1m_total_credited_usd              81,619,456.0000
+prev_1m_closing_balance_usd             79,127,720.0000
+roll3_mean_total_credited_usd           79,007,832.0000
+month_of_year                           75,608,504.0000
+delta_prev_1m_2m_closing_balance_usd    70,864,432.0000
+2026-09-21 17:00:31 | INFO    | src.train:692 | 
+--- Saved to C:\Users\MY-PC\ml_prediction\models_v1
+2026-09-21 17:00:31 | INFO    | src.train:695 |   persistence.joblib
+2026-09-21 17:00:31 | INFO    | src.train:695 |   three_month_average.joblib
+2026-09-21 17:00:31 | INFO    | src.train:695 |   ridge_change.joblib
+2026-09-21 17:00:31 | INFO    | src.train:695 |   xgboost_change.joblib
+2026-09-21 17:00:31 | INFO    | src.train:700 | 
+Now score them:  python -m src.test
+2026-09-21 17:00:31 | INFO    | pipeline:192 | Scoring ...
+2026-09-21 17:00:31 | INFO    | src.test:244 | Data      : 6,300 rows, 150 entities, 42 months (2022-01 to 2025-06), 25 features
+2026-09-21 17:00:31 | INFO    | src.test:245 | Models    : persistence, three_month_average, ridge_change, xgboost_change
+2026-09-21 17:00:31 | INFO    | src.test:246 | Trained   : through 2024-11 (read from the saved models)
+2026-09-21 17:00:31 | INFO    | src.test:247 | Scoring   : 1,050 rows over 2024-12..2025-06, 7 month(s) no model has seen
+2026-09-21 17:00:32 | INFO    | src.test:278 | 
+=== Amounts: the balance itself (sorted by wape)
+2026-09-21 17:00:32 | INFO    | src.test:280 |                        r2        mae        rmse   wape
+model                                                  
+xgboost_change      0.981 21,658.511  55,524.425 15.035
+persistence         0.981 21,903.384  56,066.356 15.205
+ridge_change        0.980 21,963.109  56,191.194 15.246
+three_month_average 0.900 35,747.467 126,931.371 24.815
+2026-09-21 17:00:32 | INFO    | src.test:282 | 
+=== Movements: change from last month's balance (sorted by wape)
+2026-09-21 17:00:32 | INFO    | src.test:289 |                         r2        mae        rmse    wape
+model                                                    
+xgboost_change       0.009 21,658.511  55,524.425  98.882
+persistence         -0.011 21,903.384  56,066.356 100.000
+ridge_change        -0.015 21,963.109  56,191.194 100.273
+three_month_average -4.180 35,747.467 126,931.371 163.205
+2026-09-21 17:00:32 | INFO    | src.test:290 | 
+  wape is a percentage. r2 below 0 on movements means worse than predicting no change.
+  mae and rmse are the same dollar errors in both tables, less the rows with no previous month.
+2026-09-21 17:00:32 | INFO    | src.test:296 | 
+=== Per model
+2026-09-21 17:00:32 | INFO    | src.test:298 | 
+  xgboost_change on 2024-12..2025-06 (1,050 rows)
+  RMSE        55,524 | MAE       21,659 | MedAE       5,187 | WAPE   15.0% | sMAPE   31.4% | R2 level  0.981 | R2 change   0.009 | skill +0.010
+  bias +5,470 | p90 abs error 65,088 | worst month 2025-01 | top 10 users hold 68% of squared error
+2026-09-21 17:00:32 | INFO    | src.test:298 | 
+  persistence on 2024-12..2025-06 (1,050 rows)
+  RMSE        56,066 | MAE       21,903 | MedAE       5,194 | WAPE   15.2% | sMAPE   31.2% | R2 level  0.981 | R2 change  -0.011
+  bias +5,763 | p90 abs error 63,853 | worst month 2025-01 | top 10 users hold 68% of squared error
+2026-09-21 17:00:32 | INFO    | src.test:298 | 
+  ridge_change on 2024-12..2025-06 (1,050 rows)
+  RMSE        56,191 | MAE       21,963 | MedAE       5,037 | WAPE   15.2% | sMAPE   31.8% | R2 level  0.980 | R2 change  -0.015 | skill -0.002
+  bias +6,277 | p90 abs error 65,401 | worst month 2025-01 | top 10 users hold 68% of squared error
+2026-09-21 17:00:32 | INFO    | src.test:298 | 
+  three_month_average on 2024-12..2025-06 (1,050 rows)
+  RMSE       126,931 | MAE       35,747 | MedAE       7,655 | WAPE   24.8% | sMAPE   40.8% | R2 level  0.900 | R2 change  -4.180 | skill -1.264
+  bias +6,077 | p90 abs error 104,298 | worst month 2024-12 | top 10 users hold 89% of squared error
+2026-09-21 17:00:32 | INFO    | src.test:304 | 
+=== xgboost_change: months scored, worst first
+2026-09-21 17:00:32 | INFO    | src.test:305 |          n_rows   rmse    mae  median_ae  wape
+month                                         
+2025-01     150 88,654 27,493      4,953    21
+2025-04     150 57,875 24,072      6,102    16
+2024-12     150 52,159 23,048      5,584    20
+2025-02     150 50,267 21,013      5,661    15
+2025-05     150 44,858 19,936      5,224    12
+2025-03     150 40,821 19,066      4,892    13
+2025-06     150 38,023 16,982      4,498    10
+2026-09-21 17:00:32 | INFO    | src.test:315 | 
+=== xgboost_change: by account-size tier
+2026-09-21 17:00:32 | INFO    | src.test:316 |             n_rows     rmse      mae  median_ae  wape
+tier                                                 
+smb            525 46,201.8 18,144.4    3,838.2  11.1
+mid            420 63,273.8 22,856.8    5,994.3  21.9
+enterprise     105 64,360.7 34,436.2   11,294.0  16.4
+2026-09-21 17:00:32 | INFO    | src.test:318 | 
+=== xgboost_change: worst users
+2026-09-21 17:00:32 | INFO    | src.test:319 |                                       n_rows    rmse     mae  median_ae  wape
+user                                                                         
+3cc7e7d7-9b84-566a-b0d0-1553262abc9b       7 302,129 141,765     32,686    33
+cd1bf6a0-1a5d-51e3-a33c-b9ef796a60d5       7 250,588 214,202    162,962   137
+6fd9fb8d-c081-5905-a451-5a54f4892d2a       7 154,509 144,129    124,375    97
+08adac91-b0fb-5007-b6df-e6e7b17b5677       7 154,140 127,603    118,846    90
+53e29029-ea4c-54d7-b389-767cea353d67       7 150,435 111,051     77,015    14
+4af1beda-0c96-515a-98a7-adac9f7f930c       7 150,390 110,176     66,294    12
+689c3322-ad2f-5fb9-8bbc-66d33e11824d       7 145,007  96,998     67,862    16
+1311a116-c84e-533a-8935-94fa21504369       7 134,200 108,614     76,286    18
+5cf790d2-112f-51af-aaed-dcb3f474b293       7 119,437  96,107     61,108    18
+b26daa40-93ee-51c4-9717-b65932b692b8       7 118,927  85,599     39,042    11
+2026-09-21 17:00:32 | INFO    | pipeline:200 | 
+==============================================================================
+2026-09-21 17:00:32 | INFO    | pipeline:201 |   TRAIN vs TEST
+2026-09-21 17:00:32 | INFO    | pipeline:202 | ==============================================================================
+2026-09-21 17:00:32 | INFO    | pipeline:203 |                      train_rmse   test_rmse  train_mae   test_mae   gap  test_wape  test_wape_change  test_r2_change  skill  skill_mae
+model                                                                                                                                 
+xgboost_change       64,710.435  55,524.425  7,484.740 21,658.511 2.894     15.035            98.882           0.009  0.010      0.011
+persistence          64,916.889  56,066.356  8,223.532 21,903.384 2.664     15.205           100.000          -0.011    NaN      0.000
+ridge_change         64,868.083  56,191.194  8,016.590 21,963.109 2.740     15.246           100.273          -0.015 -0.002     -0.003
+three_month_average  66,046.856 126,931.371  9,814.659 35,747.467 3.642     24.815           163.205          -4.180 -1.264     -0.632
+2026-09-21 17:00:32 | INFO    | pipeline:204 | 
+  train_*  scored on the rows each model was FITTED on. In-sample.
+           Not a measure of quality -- only of how hard it fitted.
+  test_*   scored on months no model has seen. This is the answer.
+  gap      test_mae / train_mae. 1.0 is honest; 3x+ is memorisation.
+           Over MAE rather than RMSE: RMSE here is set by a few very
+           large accounts, and the RMSE ratio gave a constant
+           predictor the same 0.81 as the booster.
+  skill    versus the reference baseline, on RMSE. Positive means it
+           earned its complexity; around zero means it did not.
+  skill_mae  the same on MAE: 1 - test_mae / reference test_mae.
+2026-09-21 17:00:32 | INFO    | pipeline:277 | 
+==============================================================================
+2026-09-21 17:00:32 | INFO    | pipeline:278 |   ACROSS TABLES
+2026-09-21 17:00:32 | INFO    | pipeline:279 | ==============================================================================
+2026-09-21 17:00:32 | INFO    | pipeline:280 |                             test_mae  test_wape  test_wape_change  test_r2_change   gap  skill  skill_mae
+table model                                                                                              
+v1    persistence         21,903.384     15.205           100.000          -0.011 2.664    NaN      0.000
+      ridge_change        21,963.109     15.246           100.273          -0.015 2.740 -0.002     -0.003
+      three_month_average 35,747.467     24.815           163.205          -4.180 3.642 -1.264     -0.632
+      xgboost_change      21,658.511     15.035            98.882           0.009 2.894  0.010      0.011
+2026-09-21 17:00:32 | INFO    | pipeline:286 | 
+  Compare DOWN a column within one table, not across tables: WAPE's
+  denominator moves with any change to the panel. `skill` is the
+  cross-table comparison, since it is a ratio against that table's
+  own persistence.
+2026-09-21 17:00:32 | INFO    | __main__:11 | ##### SEED 2
+2026-09-21 17:00:32 | INFO    | pipeline:264 | 
+##############################################################################
+2026-09-21 17:00:32 | INFO    | pipeline:265 | #  TABLE: v1  (feature_store_monthly)
+2026-09-21 17:00:32 | INFO    | pipeline:266 | ##############################################################################
+2026-09-21 17:00:32 | INFO    | pipeline:187 | Training ...
+2026-09-21 17:00:33 | INFO    | src.train:563 | Data      : 6,300 rows, 150 entities, 42 months (2022-01 to 2025-06), 25 features
+2026-09-21 17:00:33 | INFO    | src.train:564 | Split     : holdout: last 7m; cv: 5 expanding folds of 3m, min train 6m
+2026-09-21 17:00:33 | INFO    | src.train:565 | Models    : persistence, three_month_average, ridge_change, xgboost_change
+2026-09-21 17:00:33 | INFO    | src.train:574 | Features  : 25 columns, derived by exclusion (no `features` block; run src.features_selection to freeze a set)
+2026-09-21 17:00:33 | INFO    | src.train:602 | Training  : 5,250 rows, 35 months, 2022-01..2024-11
+2026-09-21 17:00:33 | INFO    | src.train:604 | Held out  : 1,050 rows from 2024-12 -- not read again in this script
+2026-09-21 17:00:33 | INFO    | src.train:615 | 
+--- Cross-validation (5 expanding folds inside the training region)
+2026-09-21 17:00:38 | INFO    | src.train:635 | 
+  Amounts: the balance itself (mean over folds, sorted by wape)
+2026-09-21 17:00:38 | INFO    | src.train:637 |                        r2        mae       rmse   wape  wape_std  folds
+model                                                                  
+xgboost_change      0.664 11,509.184 60,607.516 21.918    12.115      5
+persistence         0.660 11,463.608 60,824.183 21.939    11.691      5
+ridge_change        0.644 12,730.408 61,810.756 24.782    13.775      5
+three_month_average 0.634 13,936.381 62,470.242 26.038    16.276      5
+2026-09-21 17:00:38 | INFO    | src.train:635 | 
+  Movements: change from last month's balance (mean over folds, sorted by wape)
+2026-09-21 17:00:38 | INFO    | src.train:637 |                         r2        mae       rmse    wape  wape_std  folds
+model                                                                    
+xgboost_change       0.023 11,509.184 60,607.516  98.947     2.490      5
+persistence         -0.010 11,463.608 60,824.183 100.000     0.000      5
+ridge_change        -0.007 12,730.408 61,810.756 113.319    10.598      5
+three_month_average -0.063 13,936.381 62,470.242 115.002    15.765      5
+2026-09-21 17:00:38 | INFO    | src.train:638 | 
+  These are validation scores from inside the training region, for choosing between models.
+  The headline comparison is `python -m src.test`, on months no model here has seen.
+2026-09-21 17:00:38 | INFO    | src.train:645 | 
+--- Fitting on the full training region
+2026-09-21 17:00:38 | INFO    | src.train:651 |   persistence: fitted on 35 months through 2024-11
+2026-09-21 17:00:38 | INFO    | src.train:653 |     25 features
+2026-09-21 17:00:38 | INFO    | src.train:651 |   three_month_average: fitted on 35 months through 2024-11
+2026-09-21 17:00:38 | INFO    | src.train:653 |     25 features
+2026-09-21 17:00:38 | WARNING | src.models_code.ridge_reg:166 |   ridge_change: alpha settled on 1e+06, the top of the grid -- cross-validation wants every coefficient at zero, so this model is predicting the mean movement and nothing else. Widening the grid will not change that; it is a finding about the features, not about alpha.
+2026-09-21 17:00:38 | INFO    | src.train:651 |   ridge_change: ridge alpha=1e+06, target=change, 25 features
+2026-09-21 17:00:38 | INFO    | src.train:653 |     25 features
+2026-09-21 17:00:39 | INFO    | src.train:651 |   xgboost_change: 300 trees, depth 4, lr 0.03, target=change, split on 18 of 18 features
+2026-09-21 17:00:39 | INFO    | src.train:653 |     18 features, dropped ['prev_1m_spend_groceries_usd', 'prev_1m_spend_dining_usd', 'prev_1m_spend_retail_usd', 'prev_1m_spend_cash_atm_usd', 'prev_1m_spend_transport_usd', 'prev_1m_spend_bills_usd', 'prev_1m_spend_other_usd']
+2026-09-21 17:00:39 | INFO    | src.train:667 | 
+--- Tuning
+2026-09-21 17:00:39 | INFO    | src.train:669 |   ridge_change: {'alpha': 1000000.0}
+2026-09-21 17:00:39 | INFO    | src.train:685 | 
+--- ridge_change: feature importance (abs_coefficient), top 12
+2026-09-21 17:00:39 | INFO    | src.train:686 | prev_1m_closing_balance_usd            24.2516
+roll3_mean_net_flow_usd                23.7578
+roll3_mean_closing_balance_usd         21.1664
+prev_2m_closing_balance_usd            18.9493
+prev_3m_closing_balance_usd            17.9724
+prev_1m_net_flow_usd                   17.8962
+delta_prev_1m_2m_closing_balance_usd   15.0987
+prev_1m_spend_cash_atm_usd              9.4518
+days_in_month                           8.7124
+prev_1m_distinct_merchants              5.7179
+roll3_mean_total_credited_usd           5.0583
+prev_1m_total_credited_usd              4.4794
+2026-09-21 17:00:39 | INFO    | src.train:685 | 
+--- xgboost_change: feature importance (gain), top 12
+2026-09-21 17:00:39 | INFO    | src.train:686 | prev_1m_distinct_merchants             308,643,488.0000
+prev_1m_txn_count                      128,243,536.0000
+roll3_mean_net_flow_usd                126,877,728.0000
+roll3_mean_total_debited_usd           125,608,936.0000
+prev_1m_total_debited_usd              100,593,272.0000
+days_in_month                           91,050,112.0000
+roll3_std_closing_balance_usd           90,814,440.0000
+prev_1m_total_credited_usd              87,788,184.0000
+month_of_year                           79,744,664.0000
+prev_1m_closing_balance_usd             76,044,512.0000
+roll3_mean_total_credited_usd           74,658,656.0000
+delta_prev_1m_2m_closing_balance_usd    72,860,016.0000
+2026-09-21 17:00:39 | INFO    | src.train:692 | 
+--- Saved to C:\Users\MY-PC\ml_prediction\models_v1
+2026-09-21 17:00:39 | INFO    | src.train:695 |   persistence.joblib
+2026-09-21 17:00:39 | INFO    | src.train:695 |   three_month_average.joblib
+2026-09-21 17:00:39 | INFO    | src.train:695 |   ridge_change.joblib
+2026-09-21 17:00:39 | INFO    | src.train:695 |   xgboost_change.joblib
+2026-09-21 17:00:39 | INFO    | src.train:700 | 
+Now score them:  python -m src.test
+2026-09-21 17:00:39 | INFO    | pipeline:192 | Scoring ...
+2026-09-21 17:00:40 | INFO    | src.test:244 | Data      : 6,300 rows, 150 entities, 42 months (2022-01 to 2025-06), 25 features
+2026-09-21 17:00:40 | INFO    | src.test:245 | Models    : persistence, three_month_average, ridge_change, xgboost_change
+2026-09-21 17:00:40 | INFO    | src.test:246 | Trained   : through 2024-11 (read from the saved models)
+2026-09-21 17:00:40 | INFO    | src.test:247 | Scoring   : 1,050 rows over 2024-12..2025-06, 7 month(s) no model has seen
+2026-09-21 17:00:40 | INFO    | src.test:278 | 
+=== Amounts: the balance itself (sorted by wape)
+2026-09-21 17:00:40 | INFO    | src.test:280 |                        r2        mae        rmse   wape
+model                                                  
+xgboost_change      0.981 21,674.147  55,589.444 15.045
+persistence         0.981 21,903.384  56,066.356 15.205
+ridge_change        0.980 21,963.109  56,191.194 15.246
+three_month_average 0.900 35,747.467 126,931.371 24.815
+2026-09-21 17:00:40 | INFO    | src.test:282 | 
+=== Movements: change from last month's balance (sorted by wape)
+2026-09-21 17:00:40 | INFO    | src.test:289 |                         r2        mae        rmse    wape
+model                                                    
+xgboost_change       0.006 21,674.147  55,589.444  98.953
+persistence         -0.011 21,903.384  56,066.356 100.000
+ridge_change        -0.015 21,963.109  56,191.194 100.273
+three_month_average -4.180 35,747.467 126,931.371 163.205
+2026-09-21 17:00:40 | INFO    | src.test:290 | 
+  wape is a percentage. r2 below 0 on movements means worse than predicting no change.
+  mae and rmse are the same dollar errors in both tables, less the rows with no previous month.
+2026-09-21 17:00:40 | INFO    | src.test:296 | 
+=== Per model
+2026-09-21 17:00:40 | INFO    | src.test:298 | 
+  xgboost_change on 2024-12..2025-06 (1,050 rows)
+  RMSE        55,589 | MAE       21,674 | MedAE       5,246 | WAPE   15.0% | sMAPE   31.4% | R2 level  0.981 | R2 change   0.006 | skill +0.009
+  bias +5,525 | p90 abs error 65,020 | worst month 2025-01 | top 10 users hold 68% of squared error
+2026-09-21 17:00:40 | INFO    | src.test:298 | 
+  persistence on 2024-12..2025-06 (1,050 rows)
+  RMSE        56,066 | MAE       21,903 | MedAE       5,194 | WAPE   15.2% | sMAPE   31.2% | R2 level  0.981 | R2 change  -0.011
+  bias +5,763 | p90 abs error 63,853 | worst month 2025-01 | top 10 users hold 68% of squared error
+2026-09-21 17:00:40 | INFO    | src.test:298 | 
+  ridge_change on 2024-12..2025-06 (1,050 rows)
+  RMSE        56,191 | MAE       21,963 | MedAE       5,037 | WAPE   15.2% | sMAPE   31.8% | R2 level  0.980 | R2 change  -0.015 | skill -0.002
+  bias +6,277 | p90 abs error 65,401 | worst month 2025-01 | top 10 users hold 68% of squared error
+2026-09-21 17:00:40 | INFO    | src.test:298 | 
+  three_month_average on 2024-12..2025-06 (1,050 rows)
+  RMSE       126,931 | MAE       35,747 | MedAE       7,655 | WAPE   24.8% | sMAPE   40.8% | R2 level  0.900 | R2 change  -4.180 | skill -1.264
+  bias +6,077 | p90 abs error 104,298 | worst month 2024-12 | top 10 users hold 89% of squared error
+2026-09-21 17:00:40 | INFO    | src.test:304 | 
+=== xgboost_change: months scored, worst first
+2026-09-21 17:00:40 | INFO    | src.test:305 |          n_rows   rmse    mae  median_ae  wape
+month                                         
+2025-01     150 88,706 27,522      5,061    21
+2025-04     150 58,015 24,077      5,982    16
+2024-12     150 52,122 23,038      5,463    20
+2025-02     150 50,288 21,016      5,766    15
+2025-05     150 44,992 19,964      5,309    12
+2025-03     150 40,822 19,089      4,918    13
+2025-06     150 38,215 17,012      4,466    10
+2026-09-21 17:00:40 | INFO    | src.test:315 | 
+=== xgboost_change: by account-size tier
+2026-09-21 17:00:40 | INFO    | src.test:316 |             n_rows     rmse      mae  median_ae  wape
+tier                                                 
+smb            525 46,278.2 18,152.2    3,854.7  11.1
+mid            420 63,319.5 22,871.6    6,059.2  22.0
+enterprise     105 64,467.6 34,493.9   11,297.8  16.5
+2026-09-21 17:00:40 | INFO    | src.test:318 | 
+=== xgboost_change: worst users
+2026-09-21 17:00:40 | INFO    | src.test:319 |                                       n_rows    rmse     mae  median_ae  wape
+user                                                                         
+3cc7e7d7-9b84-566a-b0d0-1553262abc9b       7 302,275 142,335     32,686    33
+cd1bf6a0-1a5d-51e3-a33c-b9ef796a60d5       7 250,666 214,185    164,307   137
+6fd9fb8d-c081-5905-a451-5a54f4892d2a       7 154,865 144,538    125,807    97
+08adac91-b0fb-5007-b6df-e6e7b17b5677       7 154,633 128,178    118,864    90
+4af1beda-0c96-515a-98a7-adac9f7f930c       7 150,645 110,200     65,712    12
+53e29029-ea4c-54d7-b389-767cea353d67       7 150,414 111,077     76,453    14
+689c3322-ad2f-5fb9-8bbc-66d33e11824d       7 145,438  97,236     67,218    16
+1311a116-c84e-533a-8935-94fa21504369       7 134,418 108,693     76,404    18
+5cf790d2-112f-51af-aaed-dcb3f474b293       7 119,647  96,147     60,933    18
+b26daa40-93ee-51c4-9717-b65932b692b8       7 118,708  85,694     40,893    11
+2026-09-21 17:00:41 | INFO    | pipeline:200 | 
+==============================================================================
+2026-09-21 17:00:41 | INFO    | pipeline:201 |   TRAIN vs TEST
+2026-09-21 17:00:41 | INFO    | pipeline:202 | ==============================================================================
+2026-09-21 17:00:41 | INFO    | pipeline:203 |                      train_rmse   test_rmse  train_mae   test_mae   gap  test_wape  test_wape_change  test_r2_change  skill  skill_mae
+model                                                                                                                                 
+xgboost_change       64,717.703  55,589.444  7,490.131 21,674.147 2.894     15.045            98.953           0.006  0.009      0.010
+persistence          64,916.889  56,066.356  8,223.532 21,903.384 2.664     15.205           100.000          -0.011    NaN      0.000
+ridge_change         64,868.083  56,191.194  8,016.590 21,963.109 2.740     15.246           100.273          -0.015 -0.002     -0.003
+three_month_average  66,046.856 126,931.371  9,814.659 35,747.467 3.642     24.815           163.205          -4.180 -1.264     -0.632
+2026-09-21 17:00:41 | INFO    | pipeline:204 | 
+  train_*  scored on the rows each model was FITTED on. In-sample.
+           Not a measure of quality -- only of how hard it fitted.
+  test_*   scored on months no model has seen. This is the answer.
+  gap      test_mae / train_mae. 1.0 is honest; 3x+ is memorisation.
+           Over MAE rather than RMSE: RMSE here is set by a few very
+           large accounts, and the RMSE ratio gave a constant
+           predictor the same 0.81 as the booster.
+  skill    versus the reference baseline, on RMSE. Positive means it
+           earned its complexity; around zero means it did not.
+  skill_mae  the same on MAE: 1 - test_mae / reference test_mae.
+2026-09-21 17:00:41 | INFO    | pipeline:277 | 
+==============================================================================
+2026-09-21 17:00:41 | INFO    | pipeline:278 |   ACROSS TABLES
+2026-09-21 17:00:41 | INFO    | pipeline:279 | ==============================================================================
+2026-09-21 17:00:41 | INFO    | pipeline:280 |                             test_mae  test_wape  test_wape_change  test_r2_change   gap  skill  skill_mae
+table model                                                                                              
+v1    persistence         21,903.384     15.205           100.000          -0.011 2.664    NaN      0.000
+      ridge_change        21,963.109     15.246           100.273          -0.015 2.740 -0.002     -0.003
+      three_month_average 35,747.467     24.815           163.205          -4.180 3.642 -1.264     -0.632
+      xgboost_change      21,674.147     15.045            98.953           0.006 2.894  0.009      0.010
+2026-09-21 17:00:41 | INFO    | pipeline:286 | 
+  Compare DOWN a column within one table, not across tables: WAPE's
+  denominator moves with any change to the panel. `skill` is the
+  cross-table comparison, since it is a ratio against that table's
+  own persistence.
+2026-09-21 17:00:41 | INFO    | __main__:11 | ##### SEED 3
+2026-09-21 17:00:41 | INFO    | pipeline:264 | 
+##############################################################################
+2026-09-21 17:00:41 | INFO    | pipeline:265 | #  TABLE: v1  (feature_store_monthly)
+2026-09-21 17:00:41 | INFO    | pipeline:266 | ##############################################################################
+2026-09-21 17:00:41 | INFO    | pipeline:187 | Training ...
+2026-09-21 17:00:42 | INFO    | src.train:563 | Data      : 6,300 rows, 150 entities, 42 months (2022-01 to 2025-06), 25 features
+2026-09-21 17:00:42 | INFO    | src.train:564 | Split     : holdout: last 7m; cv: 5 expanding folds of 3m, min train 6m
+2026-09-21 17:00:42 | INFO    | src.train:565 | Models    : persistence, three_month_average, ridge_change, xgboost_change
+2026-09-21 17:00:42 | INFO    | src.train:574 | Features  : 25 columns, derived by exclusion (no `features` block; run src.features_selection to freeze a set)
+2026-09-21 17:00:42 | INFO    | src.train:602 | Training  : 5,250 rows, 35 months, 2022-01..2024-11
+2026-09-21 17:00:42 | INFO    | src.train:604 | Held out  : 1,050 rows from 2024-12 -- not read again in this script
+2026-09-21 17:00:42 | INFO    | src.train:615 | 
+--- Cross-validation (5 expanding folds inside the training region)
+2026-09-21 17:00:46 | INFO    | src.train:635 | 
+  Amounts: the balance itself (mean over folds, sorted by wape)
+2026-09-21 17:00:46 | INFO    | src.train:637 |                        r2        mae       rmse   wape  wape_std  folds
+model                                                                  
+xgboost_change      0.664 11,507.363 60,624.692 21.925    12.095      5
+persistence         0.660 11,463.608 60,824.183 21.939    11.691      5
+ridge_change        0.644 12,730.408 61,810.756 24.782    13.775      5
+three_month_average 0.634 13,936.381 62,470.242 26.038    16.276      5
+2026-09-21 17:00:46 | INFO    | src.train:635 | 
+  Movements: change from last month's balance (mean over folds, sorted by wape)
+2026-09-21 17:00:46 | INFO    | src.train:637 |                         r2        mae       rmse    wape  wape_std  folds
+model                                                                    
+xgboost_change       0.022 11,507.363 60,624.692  99.027     2.360      5
+persistence         -0.010 11,463.608 60,824.183 100.000     0.000      5
+ridge_change        -0.007 12,730.408 61,810.756 113.319    10.598      5
+three_month_average -0.063 13,936.381 62,470.242 115.002    15.765      5
+2026-09-21 17:00:46 | INFO    | src.train:638 | 
+  These are validation scores from inside the training region, for choosing between models.
+  The headline comparison is `python -m src.test`, on months no model here has seen.
+2026-09-21 17:00:46 | INFO    | src.train:645 | 
+--- Fitting on the full training region
+2026-09-21 17:00:46 | INFO    | src.train:651 |   persistence: fitted on 35 months through 2024-11
+2026-09-21 17:00:46 | INFO    | src.train:653 |     25 features
+2026-09-21 17:00:46 | INFO    | src.train:651 |   three_month_average: fitted on 35 months through 2024-11
+2026-09-21 17:00:46 | INFO    | src.train:653 |     25 features
+2026-09-21 17:00:46 | WARNING | src.models_code.ridge_reg:166 |   ridge_change: alpha settled on 1e+06, the top of the grid -- cross-validation wants every coefficient at zero, so this model is predicting the mean movement and nothing else. Widening the grid will not change that; it is a finding about the features, not about alpha.
+2026-09-21 17:00:46 | INFO    | src.train:651 |   ridge_change: ridge alpha=1e+06, target=change, 25 features
+2026-09-21 17:00:46 | INFO    | src.train:653 |     25 features
+2026-09-21 17:00:47 | INFO    | src.train:651 |   xgboost_change: 300 trees, depth 4, lr 0.03, target=change, split on 18 of 18 features
+2026-09-21 17:00:47 | INFO    | src.train:653 |     18 features, dropped ['prev_1m_spend_groceries_usd', 'prev_1m_spend_dining_usd', 'prev_1m_spend_retail_usd', 'prev_1m_spend_cash_atm_usd', 'prev_1m_spend_transport_usd', 'prev_1m_spend_bills_usd', 'prev_1m_spend_other_usd']
+2026-09-21 17:00:47 | INFO    | src.train:667 | 
+--- Tuning
+2026-09-21 17:00:47 | INFO    | src.train:669 |   ridge_change: {'alpha': 1000000.0}
+2026-09-21 17:00:47 | INFO    | src.train:685 | 
+--- ridge_change: feature importance (abs_coefficient), top 12
+2026-09-21 17:00:47 | INFO    | src.train:686 | prev_1m_closing_balance_usd            24.2516
+roll3_mean_net_flow_usd                23.7578
+roll3_mean_closing_balance_usd         21.1664
+prev_2m_closing_balance_usd            18.9493
+prev_3m_closing_balance_usd            17.9724
+prev_1m_net_flow_usd                   17.8962
+delta_prev_1m_2m_closing_balance_usd   15.0987
+prev_1m_spend_cash_atm_usd              9.4518
+days_in_month                           8.7124
+prev_1m_distinct_merchants              5.7179
+roll3_mean_total_credited_usd           5.0583
+prev_1m_total_credited_usd              4.4794
+2026-09-21 17:00:47 | INFO    | src.train:685 | 
+--- xgboost_change: feature importance (gain), top 12
+2026-09-21 17:00:47 | INFO    | src.train:686 | prev_1m_distinct_merchants             355,813,792.0000
+roll3_mean_total_debited_usd           124,040,344.0000
+prev_1m_txn_count                      121,181,056.0000
+roll3_mean_net_flow_usd                119,642,736.0000
+prev_1m_total_debited_usd               90,653,328.0000
+roll3_std_closing_balance_usd           89,498,560.0000
+days_in_month                           85,347,208.0000
+month_of_year                           78,061,008.0000
+delta_prev_1m_2m_closing_balance_usd    75,321,504.0000
+prev_1m_total_credited_usd              74,175,264.0000
+roll3_mean_total_credited_usd           73,401,736.0000
+prev_1m_closing_balance_usd             69,492,032.0000
+2026-09-21 17:00:47 | INFO    | src.train:692 | 
+--- Saved to C:\Users\MY-PC\ml_prediction\models_v1
+2026-09-21 17:00:47 | INFO    | src.train:695 |   persistence.joblib
+2026-09-21 17:00:47 | INFO    | src.train:695 |   three_month_average.joblib
+2026-09-21 17:00:47 | INFO    | src.train:695 |   ridge_change.joblib
+2026-09-21 17:00:47 | INFO    | src.train:695 |   xgboost_change.joblib
+2026-09-21 17:00:47 | INFO    | src.train:700 | 
+Now score them:  python -m src.test
+2026-09-21 17:00:47 | INFO    | pipeline:192 | Scoring ...
+2026-09-21 17:00:48 | INFO    | src.test:244 | Data      : 6,300 rows, 150 entities, 42 months (2022-01 to 2025-06), 25 features
+2026-09-21 17:00:48 | INFO    | src.test:245 | Models    : persistence, three_month_average, ridge_change, xgboost_change
+2026-09-21 17:00:48 | INFO    | src.test:246 | Trained   : through 2024-11 (read from the saved models)
+2026-09-21 17:00:48 | INFO    | src.test:247 | Scoring   : 1,050 rows over 2024-12..2025-06, 7 month(s) no model has seen
+2026-09-21 17:00:48 | INFO    | src.test:278 | 
+=== Amounts: the balance itself (sorted by wape)
+2026-09-21 17:00:48 | INFO    | src.test:280 |                        r2        mae        rmse   wape
+model                                                  
+xgboost_change      0.981 21,696.745  55,592.730 15.061
+persistence         0.981 21,903.384  56,066.356 15.205
+ridge_change        0.980 21,963.109  56,191.194 15.246
+three_month_average 0.900 35,747.467 126,931.371 24.815
+2026-09-21 17:00:48 | INFO    | src.test:282 | 
+=== Movements: change from last month's balance (sorted by wape)
+2026-09-21 17:00:48 | INFO    | src.test:289 |                         r2        mae        rmse    wape
+model                                                    
+xgboost_change       0.006 21,696.745  55,592.730  99.057
+persistence         -0.011 21,903.384  56,066.356 100.000
+ridge_change        -0.015 21,963.109  56,191.194 100.273
+three_month_average -4.180 35,747.467 126,931.371 163.205
+2026-09-21 17:00:48 | INFO    | src.test:290 | 
+  wape is a percentage. r2 below 0 on movements means worse than predicting no change.
+  mae and rmse are the same dollar errors in both tables, less the rows with no previous month.
+2026-09-21 17:00:48 | INFO    | src.test:296 | 
+=== Per model
+2026-09-21 17:00:48 | INFO    | src.test:298 | 
+  xgboost_change on 2024-12..2025-06 (1,050 rows)
+  RMSE        55,593 | MAE       21,697 | MedAE       5,105 | WAPE   15.1% | sMAPE   31.3% | R2 level  0.981 | R2 change   0.006 | skill +0.008
+  bias +5,515 | p90 abs error 64,323 | worst month 2025-01 | top 10 users hold 68% of squared error
+2026-09-21 17:00:48 | INFO    | src.test:298 | 
+  persistence on 2024-12..2025-06 (1,050 rows)
+  RMSE        56,066 | MAE       21,903 | MedAE       5,194 | WAPE   15.2% | sMAPE   31.2% | R2 level  0.981 | R2 change  -0.011
+  bias +5,763 | p90 abs error 63,853 | worst month 2025-01 | top 10 users hold 68% of squared error
+2026-09-21 17:00:48 | INFO    | src.test:298 | 
+  ridge_change on 2024-12..2025-06 (1,050 rows)
+  RMSE        56,191 | MAE       21,963 | MedAE       5,037 | WAPE   15.2% | sMAPE   31.8% | R2 level  0.980 | R2 change  -0.015 | skill -0.002
+  bias +6,277 | p90 abs error 65,401 | worst month 2025-01 | top 10 users hold 68% of squared error
+2026-09-21 17:00:48 | INFO    | src.test:298 | 
+  three_month_average on 2024-12..2025-06 (1,050 rows)
+  RMSE       126,931 | MAE       35,747 | MedAE       7,655 | WAPE   24.8% | sMAPE   40.8% | R2 level  0.900 | R2 change  -4.180 | skill -1.264
+  bias +6,077 | p90 abs error 104,298 | worst month 2024-12 | top 10 users hold 89% of squared error
+2026-09-21 17:00:48 | INFO    | src.test:304 | 
+=== xgboost_change: months scored, worst first
+2026-09-21 17:00:48 | INFO    | src.test:305 |          n_rows   rmse    mae  median_ae  wape
+month                                         
+2025-01     150 88,601 27,490      4,997    21
+2025-04     150 58,020 24,123      5,919    16
+2024-12     150 52,204 23,129      5,424    20
+2025-02     150 50,319 21,006      5,664    15
+2025-05     150 44,948 19,970      5,255    12
+2025-03     150 40,944 19,134      4,830    13
+2025-06     150 38,255 17,026      4,411    10
+2026-09-21 17:00:48 | INFO    | src.test:315 | 
+=== xgboost_change: by account-size tier
+2026-09-21 17:00:48 | INFO    | src.test:316 |             n_rows     rmse      mae  median_ae  wape
+tier                                                 
+smb            525 46,361.1 18,204.0    3,796.0  11.2
+mid            420 63,246.4 22,855.6    5,976.0  21.9
+enterprise     105 64,484.8 34,525.4   11,208.4  16.5
+2026-09-21 17:00:48 | INFO    | src.test:318 | 
+=== xgboost_change: worst users
+2026-09-21 17:00:48 | INFO    | src.test:319 |                                       n_rows    rmse     mae  median_ae  wape
+user                                                                         
+3cc7e7d7-9b84-566a-b0d0-1553262abc9b       7 301,647 141,304     31,841    33
+cd1bf6a0-1a5d-51e3-a33c-b9ef796a60d5       7 250,743 214,352    164,037   137
+6fd9fb8d-c081-5905-a451-5a54f4892d2a       7 155,049 144,640    125,391    97
+08adac91-b0fb-5007-b6df-e6e7b17b5677       7 154,263 127,771    118,547    90
+4af1beda-0c96-515a-98a7-adac9f7f930c       7 151,252 110,991     66,694    12
+53e29029-ea4c-54d7-b389-767cea353d67       7 151,103 112,047     78,113    14
+689c3322-ad2f-5fb9-8bbc-66d33e11824d       7 145,489  97,144     68,062    16
+1311a116-c84e-533a-8935-94fa21504369       7 134,493 108,807     76,600    18
+5cf790d2-112f-51af-aaed-dcb3f474b293       7 119,816  96,232     59,399    18
+b26daa40-93ee-51c4-9717-b65932b692b8       7 119,164  85,677     38,792    11
+2026-09-21 17:00:49 | INFO    | pipeline:200 | 
+==============================================================================
+2026-09-21 17:00:49 | INFO    | pipeline:201 |   TRAIN vs TEST
+2026-09-21 17:00:49 | INFO    | pipeline:202 | ==============================================================================
+2026-09-21 17:00:49 | INFO    | pipeline:203 |                      train_rmse   test_rmse  train_mae   test_mae   gap  test_wape  test_wape_change  test_r2_change  skill  skill_mae
+model                                                                                                                                 
+xgboost_change       64,710.784  55,592.730  7,493.609 21,696.745 2.895     15.061            99.057           0.006  0.008      0.009
+persistence          64,916.889  56,066.356  8,223.532 21,903.384 2.664     15.205           100.000          -0.011    NaN      0.000
+ridge_change         64,868.083  56,191.194  8,016.590 21,963.109 2.740     15.246           100.273          -0.015 -0.002     -0.003
+three_month_average  66,046.856 126,931.371  9,814.659 35,747.467 3.642     24.815           163.205          -4.180 -1.264     -0.632
+2026-09-21 17:00:49 | INFO    | pipeline:204 | 
+  train_*  scored on the rows each model was FITTED on. In-sample.
+           Not a measure of quality -- only of how hard it fitted.
+  test_*   scored on months no model has seen. This is the answer.
+  gap      test_mae / train_mae. 1.0 is honest; 3x+ is memorisation.
+           Over MAE rather than RMSE: RMSE here is set by a few very
+           large accounts, and the RMSE ratio gave a constant
+           predictor the same 0.81 as the booster.
+  skill    versus the reference baseline, on RMSE. Positive means it
+           earned its complexity; around zero means it did not.
+  skill_mae  the same on MAE: 1 - test_mae / reference test_mae.
+2026-09-21 17:00:49 | INFO    | pipeline:277 | 
+==============================================================================
+2026-09-21 17:00:49 | INFO    | pipeline:278 |   ACROSS TABLES
+2026-09-21 17:00:49 | INFO    | pipeline:279 | ==============================================================================
+2026-09-21 17:00:49 | INFO    | pipeline:280 |                             test_mae  test_wape  test_wape_change  test_r2_change   gap  skill  skill_mae
+table model                                                                                              
+v1    persistence         21,903.384     15.205           100.000          -0.011 2.664    NaN      0.000
+      ridge_change        21,963.109     15.246           100.273          -0.015 2.740 -0.002     -0.003
+      three_month_average 35,747.467     24.815           163.205          -4.180 3.642 -1.264     -0.632
+      xgboost_change      21,696.745     15.061            99.057           0.006 2.895  0.008      0.009
+2026-09-21 17:00:49 | INFO    | pipeline:286 | 
+  Compare DOWN a column within one table, not across tables: WAPE's
+  denominator moves with any change to the panel. `skill` is the
+  cross-table comparison, since it is a ratio against that table's
+  own persistence.
