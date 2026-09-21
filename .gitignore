@@ -21,3 +21,6 @@ Stage5_Forecast_The_Balance.pdf
 models/
 mypy.ini
 claude.md
+results/
+smoke_models_v1/
+smoke_models_v2/

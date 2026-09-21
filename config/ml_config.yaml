@@ -3,10 +3,6 @@ data:
     v1: feature_store_monthly
     v2: feature_store_monthly_v2
   active_table: v1
-  # Tables the benchmark runs back to back, so the v1/v2 comparison is one run
-  # against one config instead of two runs with an edit in between. Each gets
-  # its own output.model_dir (models_v1 / models_v2). Empty or absent falls
-  # back to active_table alone. Roughly doubles the runtime.
   compare_tables:
   - v1
   rename_columns:
@@ -28,6 +24,8 @@ data:
     - prev_1m_spend_transport_usd
     - prev_1m_spend_bills_usd
     - prev_1m_spend_other_usd
+    - prev_1m_total_spend_usd
+    - days_in_month
   # Points at the empty list on purpose: the base dataset carries every
   # column, and each model family narrows it with its own list (train.py,
   # FAMILY_BY_KIND). A default that dropped columns would drop them for every
@@ -102,7 +100,7 @@ models:
     # and early stopping chose 4-6 rounds because there is little to learn.
     # Depth 4 and depth 6 scored the same on the holdout.
     n_estimators: 300
-    max_depth: 4
+    max_depth: 10
     learning_rate: 0.03
     min_child_weight: 20
     subsample: 0.8
