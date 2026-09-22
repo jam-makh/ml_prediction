@@ -77,10 +77,11 @@ from src.evaluate import (
     results_table,
 )
 from src.metrics import Scores, anchor_values, score
-from src.models_code.base_class import Model, ModelFactory
+from src.models_code.base_class import AnchoredModel, Model, ModelFactory
 from src.models_code.baseline import LagAverageBaseline
 from src.models_code.ridge_reg import RidgeRegression
 from src.models_code.xgboost_model import XGBoostModel
+from src.optuna_search import reference_fold_mae, run_study
 from src.tuning import DEFAULT_SCORING
 from src.window import (
     Split,
@@ -159,6 +160,12 @@ class ModelSpec(BaseModel):
         Hyperparameter search space, or empty for fixed parameters. Passed to
         constructors that accept a ``search`` argument and ignored by the rest,
         so putting one on a baseline is a config error rather than a surprise.
+    optuna : dict
+        Optuna search space over any constructor argument, including the
+        training-target treatment (``clip``, ``market_scale``,
+        ``recency_half_life``). Run by ``train.py`` before cross-validation
+        when the top-level ``optuna.enabled`` is true; the winner replaces
+        ``params`` for the rest of the run. See ``src.optuna_search``.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -167,6 +174,7 @@ class ModelSpec(BaseModel):
     kind: str
     params: dict[str, Any] = Field(default_factory=dict)
     search: dict[str, Any] = Field(default_factory=dict)
+    optuna: dict[str, Any] = Field(default_factory=dict)
 
     def factory(self, defaults: dict[str, Any] | None = None) -> ModelFactory:
         """Return a zero-argument callable that builds this model.
@@ -500,16 +508,18 @@ def summarise_folds(
     return table
 
 
-def save_best_params(model: XGBoostModel, output_dir: Path) -> Path:
-    """Write a tuned booster's winning parameters to a readable JSON file.
+def save_best_params(model: AnchoredModel, output_dir: Path) -> Path:
+    """Write a tuned model's winning settings to a readable JSON file.
 
     The same values are pickled inside the model; this copy is for reading and
     for pasting into the config as fixed ``params`` once the search is settled.
+    Written for every model that was tuned -- by Optuna, by its own search, or
+    by ridge's inner alpha CV -- not only the booster.
 
     Parameters
     ----------
-    model : XGBoostModel
-        A fitted model whose search has run.
+    model : AnchoredModel
+        A fitted model.
     output_dir : pathlib.Path
         Directory the models are saved to.
 
@@ -519,18 +529,141 @@ def save_best_params(model: XGBoostModel, output_dir: Path) -> Path:
         ``<output_dir>/<model name>_best_params.json``, overwritten each run.
     """
     through = model.trained_through
-    record = {
+    record: dict[str, Any] = {
         "model": model.name,
         "trained_through": f"{through:%Y-%m}" if through is not None else None,
         "saved_at": pd.Timestamp.now().isoformat(timespec="seconds"),
-        "search_scoring": model.search.get("scoring", DEFAULT_SCORING),
-        "search_cv_score": model.search_cv_score_,
-        "n_estimators": model.best_iteration_,
+        "target_mode": model.target_mode,
+        "clip": model.clip,
+        "clip_cap_fitted": model.clip_cap_,
+        "market_scale": model.market_scale,
+        "recency_half_life": model.recency_half_life,
         "best_params": model.best_params_,
+        "optuna": model.optuna_,
     }
+    if isinstance(model, XGBoostModel):
+        record["xgboost_params"] = model.params
+        record["n_estimators"] = model.best_iteration_ or model.params["n_estimators"]
+        if model.search:
+            record["search_scoring"] = model.search.get("scoring", DEFAULT_SCORING)
+            record["search_cv_score"] = model.search_cv_score_
     path = output_dir / f"{model.name}_best_params.json"
-    path.write_text(json.dumps(record, indent=2), encoding="utf-8")
+    path.write_text(json.dumps(record, indent=2, default=str), encoding="utf-8")
     return path
+
+
+def tune_with_optuna(
+    specs: list[ModelSpec],
+    train: Dataset,
+    folds: list[Split],
+    evaluation: EvaluationSettings,
+    defaults: dict[str, Any],
+    settings: dict[str, Any],
+    output_dir: Path,
+) -> tuple[list[ModelSpec], dict[str, dict[str, Any]]]:
+    """Run an Optuna study for every spec with an ``optuna`` block.
+
+    Parameters
+    ----------
+    specs : list of ModelSpec
+        Every configured model.
+    train : Dataset
+        The training region. The holdout is not in it, so no trial can read it.
+    folds : list of Split
+        The same expanding folds cross-validation uses.
+    evaluation : EvaluationSettings
+        Names the reference model every trial is scored against.
+    defaults : dict
+        Run-wide constructor values.
+    settings : dict
+        Parsed config.
+    output_dir : pathlib.Path
+        Where the study storage is written.
+
+    Returns
+    -------
+    tuple of (list of ModelSpec, dict)
+        The specs with each tuned model's ``params`` replaced by its winner,
+        and the study record per tuned model name.
+
+    Raises
+    ------
+    ValueError
+        If a model is to be tuned but the reference model is not configured,
+        or there are no folds to tune on.
+    """
+    block = settings.get("optuna") or {}
+    to_tune = [spec for spec in specs if spec.optuna]
+    if not block.get("enabled", False) or not to_tune:
+        return specs, {}
+    if not folds:
+        raise ValueError("Optuna needs cross-validation folds; none were produced")
+
+    by_name = {spec.name: spec for spec in specs}
+    reference = by_name.get(evaluation.reference_model)
+    if reference is None:
+        raise ValueError(
+            f"Optuna scores against {evaluation.reference_model!r}, which is "
+            f"not in the models block"
+        )
+    reference_mae = reference_fold_mae(reference.factory(defaults), train, folds)
+    data_block = settings.get("data") or {}
+    table = str(data_block.get("active_table", "table"))
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    logger.info(
+        f"\n--- Optuna ({int(block.get('n_trials', 50))} trials per model, "
+        f"{len(folds)} folds, objective = MAE / persistence MAE)"
+    )
+    records: dict[str, dict[str, Any]] = {}
+    tuned: list[ModelSpec] = []
+    for spec in specs:
+        if not spec.optuna:
+            tuned.append(spec)
+            continue
+
+        base = dict(spec.params)
+        # Optuna owns alpha once it searches it; ridge's own RidgeCV grid would
+        # otherwise re-pick alpha inside every fit and override the trial.
+        if spec.kind == "ridge" and "alpha" in spec.optuna:
+            base["alphas"] = None
+
+        def build(params: dict[str, Any], spec: ModelSpec = spec) -> Model:
+            return spec.model_copy(update={"params": params}).factory(defaults)()
+
+        def narrow(dataset: Dataset, spec: ModelSpec = spec) -> Dataset:
+            return dataset_for(spec, dataset, data_block)
+
+        best_params, record = run_study(
+            name=f"{table}_{spec.name}",
+            space=spec.optuna,
+            base_params=base,
+            build=build,
+            narrow=narrow,
+            train=train,
+            folds=folds,
+            reference_mae=reference_mae,
+            settings=block,
+            output_dir=output_dir,
+            random_state=int(defaults.get("random_state", 42)),
+        )
+        records[spec.name] = record
+        tuned.append(spec.model_copy(update={"params": best_params, "optuna": {}}))
+        logger.info(
+            f"  {spec.name}: best {record['best_value']:.4f} (trial "
+            f"{record['best_trial']}, {record['n_complete']} complete, "
+            f"{record['n_pruned']} pruned)"
+        )
+        logger.info(f"    params     : {record['best_params']}")
+        logger.info(f"    fold ratio : {record['fold_ratio']}")
+        logger.info(f"    seed check : {record['seed_check']}")
+
+    logger.info(
+        "  Below 1.0 beats persistence on the folds. The cross-validation "
+        "table below reuses these folds, so it is optimistic for tuned models; "
+        "the holdout in src.test is the number that counts."
+    )
+    return tuned, records
 
 
 def run(config: dict[str, Any] | None = None) -> dict[str, Model]:
@@ -612,6 +745,11 @@ def run(config: dict[str, Any] | None = None) -> dict[str, Model]:
         min_train_months=split_settings.min_train_months,
     )
 
+    output_dir = resolve_output_dir(settings)
+    specs, studies = tune_with_optuna(
+        specs, train, folds, evaluation, defaults, settings, output_dir
+    )
+
     logger.info(
         f"\n--- Cross-validation ({len(folds)} expanding folds inside the "
         f"training region)"
@@ -647,6 +785,8 @@ def run(config: dict[str, Any] | None = None) -> dict[str, Model]:
     for spec in specs:
         model = spec.factory(defaults)()
         model.fit(dataset_for(spec, train, data_block))
+        if spec.name in studies and isinstance(model, AnchoredModel):
+            model.optuna_ = studies[spec.name]
         fitted[spec.name] = model
         logger.info(f"  {model.describe()}")
         dropped = [name for name in train.feature_columns if name not in model.feature_columns]
@@ -688,13 +828,14 @@ def run(config: dict[str, Any] | None = None) -> dict[str, Model]:
     # Saved last, so nothing is written unless everything fitted. Each file is
     # the whole model: preprocessing, fitted statistics, the months it saw and
     # the columns it expects.
-    output_dir = resolve_output_dir(settings)
     logger.info(f"\n--- Saved to {output_dir}")
     for spec in specs:
         path = fitted[spec.name].save(model_path(output_dir, spec.name))
         logger.info(f"  {path.name}")
         model = fitted[spec.name]
-        if isinstance(model, XGBoostModel) and model.best_params_ is not None:
+        if isinstance(model, AnchoredModel) and (
+            model.best_params_ is not None or model.optuna_ is not None
+        ):
             logger.info(f"  {save_best_params(model, output_dir).name}")
 
     logger.info("\nNow score them:  python -m src.test")

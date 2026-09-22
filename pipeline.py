@@ -43,9 +43,11 @@ from loguru import logger
 from src.config.config import load_config
 from src.data.data import build_dataset
 from src.evaluate import EvaluationReport, EvaluationSettings
+from src.importance import collect_importance, save_importance, top_features
 from src.log import console_level, setup_logging
 from src.metrics import Scores, anchor_values, score
-from src.models_code.base_class import Model
+from src.models_code.base_class import AnchoredModel, Model
+from src.models_code.xgboost_model import XGBoostModel
 from src.test import run as run_test
 from src.test import split_on_boundary, training_boundary
 from src.train import run as run_train
@@ -213,7 +215,63 @@ def run_once(config: dict[str, Any] | None = None, quiet: bool = False) -> pd.Da
         "\n           earned its complexity; around zero means it did not."
         "\n  skill_mae  the same on MAE: 1 - test_mae / reference test_mae."
     )
+    report_tuning_and_importance(models, settings)
     return table
+
+
+def report_tuning_and_importance(models: dict[str, Model], config: dict[str, Any]) -> None:
+    """Print what Optuna chose and which features carry the booster.
+
+    Both are in the log file already, from ``train.py``; they are repeated here
+    because the pipeline runs training quietly, and these are the two things a
+    run is read for after the table. The importance table and figure are also
+    written next to the models, so ``src.importance`` need not be run after.
+
+    Parameters
+    ----------
+    models : dict of str to Model
+        The fitted models from this run.
+    config : dict
+        Parsed config, for the output directory.
+
+    Returns
+    -------
+    None
+    """
+    tuned = {
+        name: model
+        for name, model in models.items()
+        if isinstance(model, AnchoredModel) and model.optuna_ is not None
+    }
+    if tuned:
+        logger.info("\n" + "=" * 78)
+        logger.info("  OPTUNA BEST PARAMS  (also in <model>_best_params.json)")
+        logger.info("=" * 78)
+        for name, model in tuned.items():
+            record = model.optuna_ or {}
+            logger.info(
+                f"  {name}: CV ratio to persistence {record.get('best_value')} "
+                f"(below 1.0 beats it), seeds {record.get('seed_check')}"
+            )
+            for key, value in (record.get("best_params") or {}).items():
+                logger.info(f"    {key:<22} {value}")
+            if model.clip_cap_ is not None:
+                logger.info(f"    {'clip cap (fitted)':<22} {model.clip_cap_:,.0f}")
+
+    table = collect_importance(
+        {name: model for name, model in models.items() if isinstance(model, AnchoredModel)}
+    )
+    boosters = [name for name, model in models.items() if isinstance(model, XGBoostModel)]
+    for name in boosters:
+        top = top_features(table, name, "total_gain")
+        logger.info("\n" + "=" * 78)
+        logger.info(f"  {name.upper()}: TOP FEATURES  (share of total gain)")
+        logger.info("=" * 78)
+        for feature, share in top.items():
+            logger.info(f"  {feature:<45} {share:>6.1f}%")
+
+    csv_path, png_path = save_importance(table, config)
+    logger.info(f"\n  Saved {csv_path.name} and {png_path.name} to {csv_path.parent}")
 
 
 def run(config: dict[str, Any] | None = None, quiet: bool = True) -> pd.DataFrame:

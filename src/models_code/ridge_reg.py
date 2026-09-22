@@ -67,6 +67,8 @@ class RidgeRegression(AnchoredModel):
     random_state : int, optional
         Accepted for interface symmetry with the booster. Ridge is
         deterministic, so it changes nothing.
+    clip, market_scale, recency_half_life : optional
+        Training-target treatment, see ``AnchoredModel``.
 
     Attributes
     ----------
@@ -83,9 +85,17 @@ class RidgeRegression(AnchoredModel):
         alphas: tuple[float, ...] | None = DEFAULT_ALPHAS,
         impute_strategy: str = "median",
         random_state: int = 42,
+        clip: float | str | None = None,
+        market_scale: bool = False,
+        recency_half_life: float | None = None,
     ) -> None:
         super().__init__(
-            name, target_mode=target_mode, anchor_column=anchor_column
+            name,
+            target_mode=target_mode,
+            anchor_column=anchor_column,
+            clip=clip,
+            market_scale=market_scale,
+            recency_half_life=recency_half_life,
         )
         self.alpha = alpha
         self.alphas = tuple(alphas) if alphas else None
@@ -152,8 +162,11 @@ class RidgeRegression(AnchoredModel):
         # the index pairs would not line up with the matrix being fitted.
         folds = self._inner_folds(dataset, usable)
 
+        weights = self._training_weights(dataset)
+        fit_params = {} if weights is None else {"ridge__sample_weight": weights[usable]}
+
         self._pipeline = self._build_pipeline(folds)
-        self._pipeline.fit(features, values)
+        self._pipeline.fit(features, values, **fit_params)
 
         chosen = self._pipeline.named_steps["ridge"]
         if hasattr(chosen, "alpha_"):

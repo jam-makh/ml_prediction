@@ -14,7 +14,7 @@ an experiment is a config edit, not a flag.
 
 ```mermaid
 flowchart TD
-    DB[("PostgreSQL<br/>feature_store_monthly_v2<br/><i>read-only, SELECT *</i>")]
+    DB[("PostgreSQL<br/>feature_store_monthly (v1, active)<br/><i>read-only, SELECT *</i>")]
     DB --> BUILD
 
     subgraph BUILD["build_dataset -- src/data/data.py"]
@@ -24,15 +24,15 @@ flowchart TD
         B1 --> B2
     end
 
-    BUILD --> CUT{"holdout_split<br/>last 8 months"}
+    BUILD --> CUT{"holdout_split<br/>last 7 months"}
 
     CUT -->|"35 months"| TRAIN
-    CUT -->|"8 months, sealed"| TEST
+    CUT -->|"7 months, sealed"| TEST
 
     subgraph TRAIN["src/train.py -- never sees the holdout"]
         direction TB
         T1["5 expanding CV folds"]
-        T2["randomised search + early stopping<br/><i>xgboost only</i>"]
+        T2["Optuna search, 50 trials per model<br/><i>ridge + xgboost, objective MAE / persistence MAE</i>"]
         T3["refit on all 35 months -> models/*.joblib"]
         T1 --> T2 --> T3
     end
@@ -139,6 +139,49 @@ information: within-month transaction timing, recurring-payment and salary
 detection, calendars of known scheduled inflows. "No model beats persistence"
 is a legitimate, well-evidenced result and should be reported as the headline.
 
+## Current xgboost parameters (Optuna)
+
+Run of 2026-09-22 on v1 (`feature_store_monthly`, 26 columns; xgboost drops
+the 9 in `data.drop_columns.xgboost` and trains on 17), trained through
+2024-11. Optuna ran 50 trials on the 5 training-region CV folds, weighted
+linearly toward the later folds. The holdout was not read by any trial. The
+full record is in `models/xgboost_change_best_params.json`.
+
+| parameter | value |
+|---|---|
+| `objective` | `reg:absoluteerror` |
+| `n_estimators` | 196 |
+| `max_depth` | 6 |
+| `learning_rate` | 0.0542 |
+| `min_child_weight` | 5.40 |
+| `subsample` | 0.923 |
+| `colsample_bytree` | 0.559 |
+| `reg_lambda` | 14.27 |
+| `clip` (training movement only) | `q0.99` (fitted cap $121,648) |
+| `market_scale` | false |
+| `recency_half_life` | 12 months |
+
+Best trial 33, with a CV ratio to persistence MAE of **0.9906** (below 1.0 beats
+it). Refitted on seeds 1/2/3 it scores 0.9905 / 0.9929 / 0.9912. The ~1% lead is
+only slightly larger than the ~0.25% seed spread. Per fold the ratio is 0.955,
+0.972, 0.978, 1.007, 0.999, so the two folds closest to the holdout are level
+with persistence or worse.
+
+Holdout (2024-12..2025-06), same run:
+
+| model | train_mae | test_mae | gap | test_wape | r2_change | skill_mae |
+|---|---|---|---|---|---|---|
+| xgboost_change | 7,393 | **21,700** | 2.94 | **15.064** | +0.009 | +0.009 |
+| persistence | 8,224 | 21,903 | 2.66 | 15.205 | -0.011 | ref |
+| ridge_change | 8,324 | 22,419 | 2.69 | 15.563 | -0.058 | -0.024 |
+| three_month_average | 9,815 | 35,747 | 3.64 | 24.815 | -4.180 | -0.632 |
+
+The tuned booster beats persistence by 0.9% MAE on the holdout. That is the
+same size as its CV lead and consistent with the conclusion above: the gain
+is real but marginal. Tuned ridge loses to persistence on both the folds
+(best ratio 1.016) and the holdout (+2.4% MAE). These numbers are for the full panel (`trim_top_entities: 0.0`) and
+cannot be compared with the 3%-trim table above.
+
 ## Known defects
 
 - `ridge` with `scaled_change` or `signed_log_change` explodes (WAPE 2.3e3 and
@@ -163,7 +206,8 @@ src/feature_engineering_v2/       the v2 ratio features
 src/window.py                     holdout and expanding-window CV folds
 src/metrics.py                    scoring, and the two framings to read it in
 src/evaluate.py                   breakdowns by month, user and account tier
-src/tuning.py                     randomised search and its folds
+src/tuning.py                     randomised search and its folds (superseded by Optuna)
+src/optuna_search.py              Optuna study on the CV folds, writes *_best_params.json
 src/importance.py                 gain and coefficient rankings
 src/models_code/base_class.py     the model interface, save/load, target modes
 src/models_code/entity_scaler.py  per-entity robust scale

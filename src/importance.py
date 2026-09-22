@@ -36,6 +36,7 @@ Run it with::
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 import matplotlib.pyplot as plt
@@ -340,6 +341,26 @@ def run(config: dict[str, Any] | None = None) -> pd.DataFrame:
         for feature, value in top.items():
             logger.info(f"  {feature:<45} {value:>14,.2f}{unit}")
 
+    csv_path, png_path = save_importance(table, settings)
+    logger.info(f"\nSaved {csv_path}\nSaved {png_path}")
+    return table
+
+
+def save_importance(table: pd.DataFrame, settings: dict[str, Any]) -> tuple[Path, Path]:
+    """Write the importance table and its figure next to the saved models.
+
+    Parameters
+    ----------
+    table : pandas.DataFrame
+        Output of ``collect_importance``.
+    settings : dict
+        Parsed config, for the output directory.
+
+    Returns
+    -------
+    tuple of (pathlib.Path, pathlib.Path)
+        The CSV and PNG paths.
+    """
     output_dir = resolve_output_dir(settings)
     csv_path = output_dir / "feature_importance.csv"
     png_path = output_dir / "feature_importance.png"
@@ -347,9 +368,7 @@ def run(config: dict[str, Any] | None = None) -> pd.DataFrame:
     figure = plot_importance(table)
     figure.savefig(png_path, dpi=150, bbox_inches="tight")
     plt.close(figure)
-
-    logger.info(f"\nSaved {csv_path}\nSaved {png_path}")
-    return table
+    return csv_path, png_path
 
 
 def main() -> None:

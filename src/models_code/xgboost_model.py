@@ -128,8 +128,15 @@ class XGBoostModel(AnchoredModel):
         Default 1. Single threaded so two runs of one config produce the same
         numbers: tree building is order-dependent across threads, and a model
         comparison that shifts between runs is one nobody can act on.
+    clip, market_scale, recency_half_life : optional
+        Training-target treatment, see ``AnchoredModel``. Recency weights
+        reach the final fit and the early-stopping fits, not the randomised
+        search.
     **params : Any
-        Anything else, passed straight to ``XGBRegressor``.
+        Anything else, passed straight to ``XGBRegressor``. ``huber_slope``,
+        when omitted under ``reg:pseudohubererror``, is set at fit time to the
+        median absolute training target, so "one typical movement" is where
+        the loss turns linear whatever axis the target is on.
 
     Attributes
     ----------
@@ -162,6 +169,9 @@ class XGBoostModel(AnchoredModel):
         reg_lambda: float = 1.0,
         random_state: int = 42,
         n_jobs: int = 1,
+        clip: float | str | None = None,
+        market_scale: bool = False,
+        recency_half_life: float | None = None,
         **params: Any,
     ) -> None:
         super().__init__(
@@ -169,6 +179,9 @@ class XGBoostModel(AnchoredModel):
             target_mode=target_mode,
             anchor_column=anchor_column,
             search=search,
+            clip=clip,
+            market_scale=market_scale,
+            recency_half_life=recency_half_life,
         )
         self.random_state = random_state
         self.params: dict[str, Any] = {
@@ -230,9 +243,18 @@ class XGBoostModel(AnchoredModel):
         features = dataset.features.loc[usable]
         values = target.to_numpy(dtype="float64")[usable]
         months = dataset.frame[dataset.time_column].loc[usable].reset_index(drop=True)
+        weights = self._training_weights(dataset)
+        if weights is not None:
+            weights = weights[usable]
+
+        if (
+            self.params["objective"] == "reg:pseudohubererror"
+            and "huber_slope" not in self.params
+        ):
+            self.params["huber_slope"] = max(float(np.median(np.abs(values))), 1e-9)
 
         if self.search:
-            self._search_and_stop(features, values, months)
+            self._search_and_stop(features, values, months, weights)
 
         # The final fit, on every training row. When early stopping ran, the
         # round count it found is fixed here and the eval set is gone -- the
@@ -242,13 +264,14 @@ class XGBoostModel(AnchoredModel):
         self._estimator = self._build(
             n_estimators=rounds, early_stopping_rounds=None
         )
-        self._estimator.fit(features, values)
+        self._estimator.fit(features, values, sample_weight=weights)
 
     def _search_and_stop(
         self,
         features: pd.DataFrame,
         values: npt.NDArray[np.float64],
         months: pd.Series,
+        weights: npt.NDArray[np.float64] | None = None,
     ) -> None:
         """Pick parameters by randomised search, then a round count by stopping.
 
@@ -260,6 +283,8 @@ class XGBoostModel(AnchoredModel):
             Training target, aligned to ``features``.
         months : pandas.Series
             Month per row, aligned to ``features``, index reset.
+        weights : numpy.ndarray of float, optional
+            Recency weights, aligned to ``features``.
 
         Returns
         -------
@@ -309,6 +334,7 @@ class XGBoostModel(AnchoredModel):
             stopper.fit(
                 features.iloc[train_idx],
                 values[train_idx],
+                sample_weight=None if weights is None else weights[train_idx],
                 eval_set=[(features.iloc[eval_idx], values[eval_idx])],
                 verbose=False,
             )

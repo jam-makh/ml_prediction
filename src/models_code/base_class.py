@@ -81,6 +81,99 @@ CHANGE_MODES: frozenset[str] = frozenset(
     {"change", "scaled_change", "signed_log_change"}
 )
 
+# Modes whose training target is a dollar movement before any transform, so a
+# dollar cap on it means what it says. The signed log has already compressed
+# the tail, and a level has no movement to cap.
+CLIPPABLE_MODES: frozenset[str] = frozenset({"change", "scaled_change"})
+
+# The three balance lags the market scale is read from. Each row carries its
+# own user's last two movements (1m-2m and 2m-3m), so the median of those over
+# one month's rows is the panel's typical movement *known at forecast time* --
+# no target is read, which is what makes it usable on the holdout.
+DEFAULT_MARKET_LAG_COLUMNS: tuple[str, ...] = (
+    "prev_1m_closing_balance_usd",
+    "prev_2m_closing_balance_usd",
+    "prev_3m_closing_balance_usd",
+)
+
+# A month with fewer usable lag movements than this falls back to the last
+# training month's scale rather than trusting a median of a handful of rows.
+MARKET_SCALE_MIN_ROWS = 20
+
+
+def market_scale_by_month(
+    frame: pd.DataFrame, time_column: str, lag_columns: tuple[str, ...]
+) -> pd.Series:
+    """Return each month's median absolute lagged movement across the panel.
+
+    Parameters
+    ----------
+    frame : pandas.DataFrame
+        Rows carrying ``time_column`` and every column in ``lag_columns``.
+    time_column : str
+        The month column.
+    lag_columns : tuple of str
+        Balance lags, most recent first. Consecutive pairs give one movement
+        each, and all of them are pooled into the month's median.
+
+    Returns
+    -------
+    pandas.Series
+        Scale per month, indexed by month. NaN where fewer than
+        ``MARKET_SCALE_MIN_ROWS`` movements were available, or the median is 0.
+    """
+    moves = pd.concat(
+        [
+            pd.DataFrame(
+                {
+                    "month": frame[time_column],
+                    "move": (frame[newer] - frame[older]).abs(),
+                }
+            )
+            for newer, older in zip(lag_columns, lag_columns[1:])
+        ]
+    ).dropna()
+    grouped = moves.groupby("month")["move"]
+    scale = grouped.median()
+    scale[(grouped.count() < MARKET_SCALE_MIN_ROWS) | (scale <= 0)] = np.nan
+    return scale
+
+
+def parse_clip(clip: float | str | None) -> float | str | None:
+    """Validate a ``clip`` setting and return it in canonical form.
+
+    Parameters
+    ----------
+    clip : float, str or None
+        A positive dollar cap, a quantile written ``"q0.995"``, or None. The
+        strings ``"none"`` and ``""`` mean None, so a search space can list
+        "no clip" alongside the caps without YAML null handling.
+
+    Returns
+    -------
+    float, str or None
+        A float dollar cap, the quantile string, or None.
+
+    Raises
+    ------
+    ValueError
+        If the cap is not positive or the quantile is not in (0.5, 1).
+    """
+    if clip is None or (isinstance(clip, str) and clip.strip().lower() in ("", "none")):
+        return None
+    if isinstance(clip, str):
+        text = clip.strip().lower()
+        if not text.startswith("q"):
+            return parse_clip(float(text))
+        level = float(text[1:])
+        if not 0.5 < level < 1.0:
+            raise ValueError(f"clip quantile must be in (0.5, 1), got {clip!r}")
+        return f"q{level:g}"
+    cap = float(clip)
+    if cap <= 0:
+        raise ValueError(f"clip must be positive, got {clip!r}")
+    return cap
+
 
 def signed_log(values: npt.NDArray[np.float64]) -> npt.NDArray[np.float64]:
     """Return ``sign(x) * log1p(|x|)``, a log that is defined for every real x.
@@ -514,6 +607,23 @@ class AnchoredModel(Model):
         The model spec's ``search`` block, or None for fixed parameters. Held
         here so every tunable model reports its result the same way; what to do
         with it is the subclass's business.
+    clip : float or str, optional
+        Cap on the training movement, in dollars (``1000000``) or as a quantile
+        of the training rows' absolute movement (``"q0.995"``). Applied to the
+        training target only -- predictions and scoring never see it, so the
+        holdout keeps every row. None (default) leaves the target alone.
+    market_scale : bool, optional
+        Divide the training movement by the panel's typical movement for that
+        month (``market_scale_by_month``) and multiply predictions back. Puts
+        months before and after a regime shift on one axis. ``change`` mode
+        only. Default False.
+    recency_half_life : float, optional
+        Weight training rows by ``0.5 ** (age_in_months / half_life)``, age
+        measured back from the last training month. None (default) weights
+        every row equally.
+    market_lag_columns : tuple of str, optional
+        The balance lags ``market_scale`` reads. Default
+        ``DEFAULT_MARKET_LAG_COLUMNS``.
 
     Attributes
     ----------
@@ -541,6 +651,10 @@ class AnchoredModel(Model):
         search: dict[str, Any] | None = None,
         scale_floor_fraction: float = DEFAULT_FLOOR_FRACTION,
         scale_min_rows: int = DEFAULT_MIN_ROWS,
+        clip: float | str | None = None,
+        market_scale: bool = False,
+        recency_half_life: float | None = None,
+        market_lag_columns: tuple[str, ...] = DEFAULT_MARKET_LAG_COLUMNS,
     ) -> None:
         super().__init__(name)
         allowed = ("level", *sorted(CHANGE_MODES))
@@ -548,18 +662,41 @@ class AnchoredModel(Model):
             raise ValueError(
                 f"Unknown target_mode {target_mode!r}; expected one of {allowed}"
             )
+        # Refused here rather than ignored: a search that samples an
+        # incompatible pair should fail that trial, not score a model that
+        # silently skipped half its configuration.
+        if clip is not None and target_mode not in CLIPPABLE_MODES:
+            raise ValueError(
+                f"{name}: clip needs target_mode in {sorted(CLIPPABLE_MODES)}, "
+                f"got {target_mode!r}"
+            )
+        if market_scale and target_mode != "change":
+            raise ValueError(
+                f"{name}: market_scale needs target_mode 'change', got {target_mode!r}"
+            )
         self.target_mode: TargetMode = target_mode
         self.anchor_column = anchor_column
         self.search = search or {}
         self.scale_floor_fraction = float(scale_floor_fraction)
         self.scale_min_rows = int(scale_min_rows)
+        self.clip = parse_clip(clip)
+        self.market_scale = bool(market_scale)
+        self.recency_half_life = (
+            float(recency_half_life) if recency_half_life is not None else None
+        )
+        self.market_lag_columns = tuple(market_lag_columns)
 
         self.best_params_: dict[str, Any] | None = None
         self.search_cv_score_: float | None = None
+        # Set by train.py when an Optuna study chose this model's settings:
+        # the winning trial, its score and the study it came from.
+        self.optuna_: dict[str, Any] | None = None
 
-        # Fitted in _training_target, which is reached only from _fit, so this
+        # Fitted in _training_target, which is reached only from _fit, so these
         # can never see a row the model was not handed for training.
         self.scaler_: EntityScaler | None = None
+        self.clip_cap_: float | None = None
+        self.fallback_market_scale_: float | None = None
 
     @property
     def required_columns(self) -> tuple[str, ...]:
@@ -572,14 +709,15 @@ class AnchoredModel(Model):
         Returns
         -------
         tuple of str
-            Feature columns, plus the anchor column in change mode.
+            Feature columns, plus the anchor column in change mode and the
+            balance lags when ``market_scale`` is on.
         """
-        if (
-            self.target_mode in CHANGE_MODES
-            and self.anchor_column not in self._feature_columns
-        ):
-            return (*self._feature_columns, self.anchor_column)
-        return self._feature_columns
+        columns = list(self._feature_columns)
+        if self.target_mode in CHANGE_MODES:
+            columns.append(self.anchor_column)
+        if self.market_scale:
+            columns.extend(self.market_lag_columns)
+        return tuple(dict.fromkeys(columns))
 
     def _training_target(self, dataset: Dataset) -> pd.Series:
         """Return what the estimator should be fitted against.
@@ -628,8 +766,10 @@ class AnchoredModel(Model):
                 index=dataset.target.index,
             )
 
-        change = dataset.target - anchor
+        change = self._clip_change(dataset.target - anchor)
         if self.target_mode == "change":
+            if self.market_scale:
+                return change / self._market_scale(dataset, fit=True)
             return change
 
         entities = dataset.frame[dataset.id_column]
@@ -685,10 +825,93 @@ class AnchoredModel(Model):
             movement = self.scaler_.inverse_transform(
                 dataset.frame[dataset.id_column], predicted
             )
+        elif self.market_scale:
+            movement = predicted * self._market_scale(dataset).to_numpy(dtype="float64")
         else:
             movement = predicted
 
         return np.where(np.isfinite(anchor), anchor + movement, movement)
+
+    def _clip_change(self, change: pd.Series) -> pd.Series:
+        """Cap the training movement at ``clip``, fitting the cap if needed.
+
+        Called only from ``_training_target``, so a quantile cap is estimated
+        on the rows this model was handed for training -- per fold under
+        cross-validation -- and never on a held-out month.
+
+        Parameters
+        ----------
+        change : pandas.Series
+            Dollar movement per training row.
+
+        Returns
+        -------
+        pandas.Series
+            The movement with both tails capped at the same absolute value, or
+            unchanged when ``clip`` is None.
+        """
+        if self.clip is None:
+            return change
+        if isinstance(self.clip, str):
+            cap = float(change.abs().quantile(float(self.clip[1:])))
+        else:
+            cap = float(self.clip)
+        self.clip_cap_ = cap
+        return change.clip(lower=-cap, upper=cap)
+
+    def _market_scale(self, dataset: Dataset, fit: bool = False) -> pd.Series:
+        """Return the market scale for every row of ``dataset``.
+
+        Parameters
+        ----------
+        dataset : Dataset
+            Rows to scale. The scale of a month is read from that month's own
+            rows' balance lags, so it needs no target and no other month.
+        fit : bool, optional
+            True from ``_training_target``: records the last training month's
+            scale as the fallback for months too thin to measure.
+
+        Returns
+        -------
+        pandas.Series
+            One positive scale per row, aligned to ``dataset.frame``.
+
+        Raises
+        ------
+        ValueError
+            If no month in the training rows yields a scale.
+        """
+        by_month = market_scale_by_month(
+            dataset.frame, dataset.time_column, self.market_lag_columns
+        )
+        if fit:
+            measured = by_month.dropna()
+            if measured.empty:
+                raise ValueError(f"{self.name}: market_scale found no usable month")
+            self.fallback_market_scale_ = float(measured.iloc[-1])
+        per_row = dataset.frame[dataset.time_column].map(by_month)
+        return per_row.fillna(self.fallback_market_scale_).astype("float64")
+
+    def _training_weights(self, dataset: Dataset) -> npt.NDArray[np.float64] | None:
+        """Return per-row recency weights for the training rows, or None.
+
+        Parameters
+        ----------
+        dataset : Dataset
+            Training rows.
+
+        Returns
+        -------
+        numpy.ndarray of float or None
+            ``0.5 ** (age / recency_half_life)`` with age in months back from
+            the latest training month, or None when no half-life is set.
+        """
+        if self.recency_half_life is None:
+            return None
+        months = dataset.frame[dataset.time_column]
+        latest = months.max()
+        age = (latest.year - months.dt.year) * 12 + (latest.month - months.dt.month)
+        return np.power(0.5, age.to_numpy(dtype="float64") / self.recency_half_life)
 
     def _usable_rows(self, target: pd.Series) -> npt.NDArray[np.bool_]:
         """Return the mask of rows with a target the estimator can learn from.
