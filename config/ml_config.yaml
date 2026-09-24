@@ -25,10 +25,6 @@ data:
   # FAMILY_BY_KIND). A default that dropped columns would drop them for every
   # family.
   default_drop_columns: mean
-  # 2025-07 is an unfinished month: 99.3% of its targets equal last month's
-  # balance exactly, which hands persistence a free month in the holdout.
-  exclude_months:
-  - '2025-07-01'
   # Share of users dropped as whales, ranked on median |prev_1m_closing_balance_usd|
   # over the TRAINING months only, so the choice cannot read the holdout.
   # Entities, not rows: trimming rows would gap a user's own lag features and
@@ -39,9 +35,9 @@ data:
   trim_top_entities: 0.0
   random_state: 42
 split:
-  # 7, not 8, since 2025-07 is excluded: keeps training through 2024-11 and
-  # the holdout at 2024-12..2025-06, the same cut as before the exclusion.
-  test_months: 7
+  # Last floor(share x months) months are the holdout; src/month_cut.py is the
+  # one rule, shared by the pipeline and the Spark feature build.
+  test_share: 0.2
   gap_months: 0
   cv_folds: 5
   cv_test_months: 3
@@ -83,8 +79,6 @@ models:
     n_months: 3
 - name: ridge_change
   kind: ridge
-  params:
-    target_mode: change
   # Searched by Optuna when optuna.enabled is true; params above stay fixed.
   optuna:
     alpha: {low: 0.01, high: 1000000.0, log: true}
@@ -99,7 +93,6 @@ models:
 - name: xgboost_change
   kind: xgboost
   params:
-    target_mode: change
     # Fallback when optuna.enabled is false. Depth 10 memorised (train MAE
     # 6.5k against persistence's 8.2k, same test error); depth 4 and depth 6
     # scored the same on the holdout.

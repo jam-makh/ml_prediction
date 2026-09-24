@@ -184,16 +184,9 @@ cannot be compared with the 3%-trim table above.
 
 ## Known defects
 
-- `ridge` with `scaled_change` or `signed_log_change` explodes (WAPE 2.3e3 and
-  3.8e6). The inverse transforms are unstable; both modes are unusable as written.
 - `reg:pseudohubererror` predicts a **literal constant** — `huber_slope`
   defaults to 1 on a dollar-scale target, so the gradient saturates immediately.
   It appears to win benchmarks because it has rediscovered persistence.
-- `models[].search.scoring: r2` in the config contradicts
-  `tuning.DEFAULT_SCORING = "neg_median_absolute_error"` and its stated
-  reasoning, and searches on squared error while fitting `reg:absoluteerror`.
-  **Not cosmetic:** the search plus early stopping settles on 4-6 trees and
-  scores `r2_change` -0.006 where untuned defaults score +0.026.
 
 ## Layout
 
@@ -206,13 +199,15 @@ src/feature_engineering_v2/       the v2 ratio features
 src/window.py                     holdout and expanding-window CV folds
 src/metrics.py                    scoring, and the two framings to read it in
 src/evaluate.py                   breakdowns by month, user and account tier
-src/tuning.py                     randomised search and its folds (superseded by Optuna)
 src/optuna_search.py              Optuna study on the CV folds, writes *_best_params.json
 src/importance.py                 gain and coefficient rankings
-src/models_code/base_class.py     the model interface, save/load, target modes
-src/models_code/entity_scaler.py  per-entity robust scale
+src/month_cut.py                  the train/holdout month cut (pure Python)
+src/feature_engineering_v3/       v3 features and segment tables (PySpark)
+src/models_code/base_class.py     the Model interface, save/load
+src/models_code/exceptions.py     NotFittedError
+src/models_code/anchored_model.py change target, clip, market scale, recency weights
 src/models_code/baseline.py       persistence (n_months 1), 3-month average
-src/models_code/ridge_reg.py      ridge, level and change target modes
+src/models_code/ridge_reg.py      ridge on the monthly change
 src/models_code/xgboost_model.py  boosted trees, deliberately small
 src/train.py / src/test.py        fit + save / score on unseen months
 notebooks/                        local exploration only

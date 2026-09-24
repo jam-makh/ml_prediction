@@ -13,7 +13,7 @@ Call ``setup_logging`` once, from the entry point. Library code only does
 from __future__ import annotations
 
 import sys
-from collections.abc import Iterator
+from collections.abc import Generator
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -64,7 +64,7 @@ def setup_logging(
 
 
 @contextmanager
-def console_level(level: str) -> Iterator[None]:
+def console_level(level: str) -> Generator[None, None, None]:
     """Raise the console threshold for a block; the file still gets everything.
 
     What ``pipeline.py``'s quiet mode uses instead of redirecting stdout: the

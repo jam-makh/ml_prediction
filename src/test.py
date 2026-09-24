@@ -11,7 +11,7 @@ everything strictly after the last of them. That matters because the obvious
 alternative -- recompute "the last N months" from the config -- has two failure
 modes, both silent:
 
-* someone edits ``split.test_months`` between the two runs, the boundary moves,
+* someone edits ``split.test_share`` between the two runs, the boundary moves,
   and the models are scored on months they were trained on. The numbers improve.
   Nothing warns.
 * new rows land in the feature table between the two runs, the last N months

@@ -24,7 +24,7 @@ fitting a scaler before the split, just harder to see.
 **What the saved file carries.** Each model pickles itself whole, including the
 months it was fitted on. ``test.py`` reads that and scores everything strictly
 after it, so the train/test boundary is a fact produced by the fit rather than a
-cut-off recomputed from config in two places. Change ``split.test_months``
+cut-off recomputed from config in two places. Change ``split.test_share``
 between a train run and a test run and nothing silently moves: the models still
 say where they stopped.
 
@@ -67,8 +67,6 @@ from src.data.data import (
     Dataset,
     build_dataset,
     resolve_drop_columns,
-    suspicious_months,
-    unchanged_share_by_month,
 )
 from src.evaluate import (
     AMOUNT_COLUMNS,
@@ -77,12 +75,12 @@ from src.evaluate import (
     results_table,
 )
 from src.metrics import Scores, anchor_values, score
-from src.models_code.base_class import AnchoredModel, Model, ModelFactory
+from src.models_code.anchored_model import AnchoredModel
+from src.models_code.base_class import Model
 from src.models_code.baseline import LagAverageBaseline
 from src.models_code.ridge_reg import RidgeRegression
 from src.models_code.xgboost_model import XGBoostModel
 from src.optuna_search import reference_fold_mae, run_study
-from src.tuning import DEFAULT_SCORING
 from src.window import (
     Split,
     SplitSettings,
@@ -110,6 +108,9 @@ MODEL_REGISTRY: dict[str, Callable[..., Model]] = {
 # greppable, and the alternative was inspecting every constructor's signature at
 # runtime to find out what it would tolerate.
 RUN_DEFAULTS = ("random_state", "anchor_column")
+
+# A model is rebuilt for every fold, so a zero-argument factory is passed around instead of an instance.
+ModelFactory = Callable[[], Model]
 
 # Which `data.drop_columns` list each model kind reads. Before this existed the
 # dataset was built once with `default_drop_columns`, so every model got the
@@ -156,10 +157,6 @@ class ModelSpec(BaseModel):
         Which constructor to use, a key of ``MODEL_REGISTRY``.
     params : dict
         Keyword arguments passed straight to that constructor.
-    search : dict
-        Hyperparameter search space, or empty for fixed parameters. Passed to
-        constructors that accept a ``search`` argument and ignored by the rest,
-        so putting one on a baseline is a config error rather than a surprise.
     optuna : dict
         Optuna search space over any constructor argument, including the
         training-target treatment (``clip``, ``market_scale``,
@@ -173,7 +170,6 @@ class ModelSpec(BaseModel):
     name: str
     kind: str
     params: dict[str, Any] = Field(default_factory=dict)
-    search: dict[str, Any] = Field(default_factory=dict)
     optuna: dict[str, Any] = Field(default_factory=dict)
 
     def factory(self, defaults: dict[str, Any] | None = None) -> ModelFactory:
@@ -218,8 +214,6 @@ class ModelSpec(BaseModel):
         for key, value in (defaults or {}).items():
             if key in accepted:
                 arguments.setdefault(key, value)
-        if self.search:
-            arguments["search"] = self.search
 
         def build() -> Model:
             try:
@@ -513,8 +507,7 @@ def save_best_params(model: AnchoredModel, output_dir: Path) -> Path:
 
     The same values are pickled inside the model; this copy is for reading and
     for pasting into the config as fixed ``params`` once the search is settled.
-    Written for every model that was tuned -- by Optuna, by its own search, or
-    by ridge's inner alpha CV -- not only the booster.
+    Written for every model tuned by Optuna or by ridge's inner alpha CV.
 
     Parameters
     ----------
@@ -533,7 +526,6 @@ def save_best_params(model: AnchoredModel, output_dir: Path) -> Path:
         "model": model.name,
         "trained_through": f"{through:%Y-%m}" if through is not None else None,
         "saved_at": pd.Timestamp.now().isoformat(timespec="seconds"),
-        "target_mode": model.target_mode,
         "clip": model.clip,
         "clip_cap_fitted": model.clip_cap_,
         "market_scale": model.market_scale,
@@ -543,10 +535,6 @@ def save_best_params(model: AnchoredModel, output_dir: Path) -> Path:
     }
     if isinstance(model, XGBoostModel):
         record["xgboost_params"] = model.params
-        record["n_estimators"] = model.best_iteration_ or model.params["n_estimators"]
-        if model.search:
-            record["search_scoring"] = model.search.get("scoring", DEFAULT_SCORING)
-            record["search_cv_score"] = model.search_cv_score_
     path = output_dir / f"{model.name}_best_params.json"
     path.write_text(json.dumps(record, indent=2, default=str), encoding="utf-8")
     return path
@@ -710,26 +698,11 @@ def run(config: dict[str, Any] | None = None) -> dict[str, Model]:
             f"freeze a set)"
         )
 
-    # Re-run on every run rather than trusting the config to stay correct. A
-    # month whose targets simply repeat the previous month's balances is an
-    # unfinished month, and it makes every persistence-flavoured model look
-    # near perfect. Warned about rather than dropped automatically: silently
-    # discarding data is how a pipeline starts lying about its own inputs.
-    flagged = suspicious_months(dataset, evaluation.anchor_column)
-    if len(flagged):
-        shares = unchanged_share_by_month(dataset, evaluation.anchor_column)
-        logger.warning("Months where the target barely moves from last month:")
-        for month in flagged:
-            logger.warning(
-                f"  {month:%Y-%m}: {100 * shares[month]:.0f}% of rows unchanged. "
-                f"Add it to data.exclude_months, or explain why it is real."
-            )
-
     # The holdout is cut here and then discarded. `train` is the only dataset
     # anything below this line sees, so nothing in this file can read a
     # held-out month even by mistake.
     holdout = holdout_split(
-        dataset, split_settings.test_months, split_settings.gap_months
+        dataset, split_settings.test_share, split_settings.gap_months
     )
     train = dataset.take(holdout.train_positions)
     logger.info(f"Training  : {holdout.n_train:,} rows, {len(train.months)} months, "
@@ -807,13 +780,6 @@ def run(config: dict[str, Any] | None = None) -> dict[str, Model]:
         logger.info("\n--- Tuning")
         for name, model in tuned.items():
             logger.info(f"  {name}: {getattr(model, 'best_params_', None)}")
-            rounds = getattr(model, "best_iteration_", None)
-            if rounds:
-                logger.info(
-                    f"    {rounds} rounds, the median of "
-                    f"{getattr(model, 'stopping_rounds_', [])} across the "
-                    f"early-stopping folds"
-                )
 
     # Which columns carried each fitted model. Gain is measured over splits the
     # tree actually made, so a column that earns its place only in combination

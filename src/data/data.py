@@ -411,67 +411,6 @@ def validate_frame(
         )
 
 
-def unchanged_share_by_month(
-    dataset: Dataset, anchor_column: str, tolerance: float = 1e-6
-) -> pd.Series:
-    """Return the share of rows per month whose target did not move at all.
-
-    A diagnostic, not a rule. A month where almost every user's closing balance
-    equals last month's is not a month where nothing happened, it is a month
-    that was not finished when the table was built. Such a month makes any
-    persistence-flavoured predictor look near perfect, which is exactly the kind
-    of flattering number the brief warns about.
-
-    Parameters
-    ----------
-    dataset : Dataset
-        The panel to inspect.
-    anchor_column : str
-        Column holding last month's closing balance.
-    tolerance : float, optional
-        Absolute movement below this counts as no movement. Default 1e-6.
-
-    Returns
-    -------
-    pandas.Series
-        Share between 0 and 1, indexed by month, in month order. Empty when the
-        anchor column is absent.
-    """
-    if anchor_column not in dataset.frame.columns:
-        return pd.Series(dtype="float64")
-
-    movement = (dataset.target - dataset.frame[anchor_column]).abs()
-    unchanged = (movement <= tolerance) & movement.notna()
-    return unchanged.groupby(dataset.times).mean().sort_index()
-
-
-def suspicious_months(
-    dataset: Dataset, anchor_column: str, threshold: float = 0.9
-) -> pd.DatetimeIndex:
-    """Return months where nearly every target equals last month's balance.
-
-    Parameters
-    ----------
-    dataset : Dataset
-        The panel to inspect.
-    anchor_column : str
-        Column holding last month's closing balance.
-    threshold : float, optional
-        Share of unchanged rows above which a month is flagged. Default 0.9, so
-        a month of genuinely dormant users is not flagged while an unfinished
-        month is.
-
-    Returns
-    -------
-    pandas.DatetimeIndex
-        The flagged months, ascending.
-    """
-    shares = unchanged_share_by_month(dataset, anchor_column)
-    if shares.empty:
-        return pd.DatetimeIndex([])
-    return pd.DatetimeIndex(shares[shares >= threshold].index)
-
-
 def load_feature_frame(
     config: dict[str, Any] | None = None, engine: Engine | None = None
 ) -> pd.DataFrame:
@@ -646,7 +585,7 @@ def trim_whale_entities(
     time_column: str,
     size_column: str,
     share: float,
-    test_months: int,
+    test_share: float,
     gap_months: int = 0,
 ) -> pd.DataFrame:
     """Drop the largest ``share`` of entities, ranked by account size.
@@ -685,8 +624,8 @@ def trim_whale_entities(
         absolute value.
     share : float
         Share of entities to drop, between 0 and 1. 0.05 drops the largest 5%.
-    test_months : int
-        Length of the holdout, so the ranking can avoid it.
+    test_share : float
+        Share of months in the holdout, so the ranking can avoid it.
     gap_months : int, optional
         Months discarded between train and test. Default 0.
 
@@ -718,7 +657,7 @@ def trim_whale_entities(
     from src.window import plan_month_cut
 
     months = pd.DatetimeIndex(sorted(frame[time_column].unique()))
-    train_months, _ = plan_month_cut(months, test_months, gap_months)
+    train_months, _ = plan_month_cut(months, test_share, gap_months)
     seen = frame.loc[frame[time_column].isin(train_months)]
 
     size = seen.groupby(id_column)[size_column].apply(lambda col: col.abs().median())
@@ -802,10 +741,6 @@ def build_dataset(
     # because it is an output of feature selection rather than a property of
     # the source table. Empty or absent means "derive by exclusion".
     keep_columns = tuple(str(name) for name in (settings.get("features") or ()))
-    exclude_months = tuple(
-        pd.Timestamp(str(month)).to_period(MONTH_PERIOD).to_timestamp()
-        for month in data_settings.get("exclude_months") or ()
-    )
 
     if frame is not None:
         raw = frame
@@ -837,18 +772,7 @@ def build_dataset(
     if typed.empty:
         raise ValueError(f"Every row is missing {target_column!r}")
 
-    # Months the config rules out, usually an unfinished one at the end of the
-    # panel. Dropped here rather than filtered in the SQL so the reason stays
-    # next to the measurement that justified it, and so the notebook can look
-    # at the excluded month by clearing one config key.
-    if exclude_months:
-        typed = typed.loc[~typed[time_column].isin(exclude_months)]
-        if typed.empty:
-            raise ValueError(
-                f"data.exclude_months removed every row; excluded {list(exclude_months)}"
-            )
-
-    # The whale trim. After the month filters so the ranking sees the same
+    # The whale trim. After the target filter so the ranking sees the same
     # months everything else does, and before the sort so the sort is done once
     # on the surviving rows. Reads `split` as well as `data`, because which
     # months count as training is a property of the split and duplicating the
@@ -866,7 +790,7 @@ def build_dataset(
                 )
             ),
             share=trim_share,
-            test_months=int(split_settings.get("test_months", 8)),
+            test_share=float(split_settings.get("test_share", 0.2)),
             gap_months=int(split_settings.get("gap_months", 0)),
         )
 

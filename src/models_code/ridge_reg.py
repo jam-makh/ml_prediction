@@ -31,7 +31,8 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
 from src.data.data import Dataset
-from src.models_code.base_class import AnchoredModel, TargetMode
+from src.models_code.anchored_model import AnchoredModel
+from src.window import MonthlyExpandingSplit
 
 # Spans nine orders of magnitude so the CV curve has a genuine interior minimum
 # to find rather than being pinned at an end. The top matters here: with the
@@ -51,10 +52,8 @@ class RidgeRegression(AnchoredModel):
     ----------
     name : str, optional
         Label for result tables. Default ``ridge``.
-    target_mode : str, optional
-        ``level`` or ``change``. Default ``change``.
     anchor_column : str, optional
-        Column holding last month's balance, read only in change mode.
+        Column holding last month's balance.
     alpha : float, optional
         Fixed regularisation strength. Ignored when ``alphas`` is given, which
         is the default -- set this only to pin a value and skip the inner CV.
@@ -79,7 +78,6 @@ class RidgeRegression(AnchoredModel):
     def __init__(
         self,
         name: str = "ridge",
-        target_mode: TargetMode = "change",
         anchor_column: str = "prev_1m_closing_balance_usd",
         alpha: float = 1.0,
         alphas: tuple[float, ...] | None = DEFAULT_ALPHAS,
@@ -91,7 +89,6 @@ class RidgeRegression(AnchoredModel):
     ) -> None:
         super().__init__(
             name,
-            target_mode=target_mode,
             anchor_column=anchor_column,
             clip=clip,
             market_scale=market_scale,
@@ -187,7 +184,7 @@ class RidgeRegression(AnchoredModel):
                 logger.warning(
                     f"  {self.name}: alpha settled on {picked:g}, the bottom of "
                     f"the grid -- the fit wants less penalty than it was "
-                    f"offered. Widen DEFAULT_ALPHAS downward in mlr.py."
+                    f"offered. Widen DEFAULT_ALPHAS downward in ridge_reg.py."
                 )
         else:
             self.best_params_ = {"alpha": float(self.alpha)}
@@ -208,24 +205,14 @@ class RidgeRegression(AnchoredModel):
             Fold index pairs, or None when the training region is too short to
             produce any -- in which case ``RidgeCV`` uses leave-one-out.
         """
-        # Imported here rather than at module scope: tuning imports window,
-        # window imports data, and a top-level import would make the model
-        # modules depend on the search machinery just to define a class.
-        from src.tuning import month_folds
-
-        months = dataset.frame[dataset.time_column].loc[usable]
-        try:
-            folds = month_folds(
-                months.reset_index(drop=True),
-                n_folds=3,
-                test_months=3,
-            )
-        except ValueError:
-            return None
+        months = dataset.frame[dataset.time_column].loc[usable].reset_index(drop=True)
+        splitter = MonthlyExpandingSplit(n_folds=3, test_months=3)
+        # X is only used for its length; the months go in as groups.
+        folds = list(splitter.split(np.empty((len(months), 1)), groups=months))
         return folds or None
 
     def _predict(self, dataset: Dataset) -> npt.NDArray[np.float64]:
-        """Predict, putting the level back together in change mode.
+        """Predict the change and turn it back into a balance.
 
         Parameters
         ----------
@@ -235,7 +222,7 @@ class RidgeRegression(AnchoredModel):
         Returns
         -------
         numpy.ndarray of float
-            One prediction per row, on the balance scale in both modes.
+            One prediction per row, on the balance scale.
         """
         assert self._pipeline is not None  # guaranteed by Model.predict
         # The columns this model was fitted on, not the dataset's own feature
@@ -283,12 +270,12 @@ class RidgeRegression(AnchoredModel):
         Returns
         -------
         str
-            The chosen alpha, the target mode, and the feature count.
+            The chosen alpha and the feature count.
         """
         if not self.is_fitted:
             return f"{self.name} (not fitted)"
         alpha = (self.best_params_ or {}).get("alpha", self.alpha)
         return (
-            f"{self.name}: ridge alpha={alpha:g}, target={self.target_mode}, "
+            f"{self.name}: ridge alpha={alpha:g}, "
             f"{len(self._feature_columns)} features"
         )

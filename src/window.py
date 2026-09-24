@@ -8,7 +8,7 @@ that come after the ones it is scored on, for the very same users.
 
 So every split here cuts along the month axis and nothing else:
 
-* ``holdout_split`` keeps the last ``test_months`` months as the test set and
+* ``holdout_split`` keeps the last ``test_share`` of months as the test set and
   everything before them as train.
 * ``expanding_folds`` walks that same cut backwards through the training
   region, giving several (train, test) pairs where the training window grows
@@ -18,7 +18,7 @@ So every split here cuts along the month axis and nothing else:
   search object as ``cv=``.
 
 Everything here is used by the *training* side only -- ``train.py``,
-``tuning.py`` and ``features_selection.py``, all of which live entirely inside
+``optuna_search.py`` and ``features_selection.py``, all of which live entirely inside
 the training region. ``test.py`` does not import this module. It asks the saved
 model which months it was fitted on and scores everything strictly after that,
 so the boundary between train and test is a fact recorded by the fit rather
@@ -51,6 +51,7 @@ import pandas as pd
 from pydantic import BaseModel, ConfigDict, Field
 
 from src.data.data import MONTH_PERIOD, Dataset
+from src.month_cut import cut_positions
 
 
 class Split(BaseModel):
@@ -197,21 +198,19 @@ def positions_in_months(
 
 
 def plan_month_cut(
-    months: pd.DatetimeIndex, test_months: int, gap_months: int = 0
+    months: pd.DatetimeIndex, test_share: float, gap_months: int = 0
 ) -> tuple[pd.DatetimeIndex, pd.DatetimeIndex]:
     """Split an ordered list of months into a train block and a test block.
 
-    The last ``test_months`` months become test. The ``gap_months`` months
-    immediately before them are dropped from both sides rather than given to
-    train, which is the only honest way to leave a gap: handing them to train
-    would defeat the point of asking for one.
+    The last ``floor(test_share * len(months))`` months become test, and the
+    ``gap_months`` before them are dropped from both sides.
 
     Parameters
     ----------
     months : pandas.DatetimeIndex
         All distinct months, ascending.
-    test_months : int
-        How many months at the end form the test block.
+    test_share : float
+        Share of months held out at the end, between 0 and 1.
     gap_months : int, optional
         Months to discard between the two blocks. Default 0.
 
@@ -223,34 +222,20 @@ def plan_month_cut(
     Raises
     ------
     ValueError
-        If the counts are not positive, or if the cut would leave no training
-        months at all.
+        If the share or gap is invalid, or either block would be empty.
     """
-    if test_months < 1:
-        raise ValueError(f"test_months must be at least 1, got {test_months}")
-    if gap_months < 0:
-        raise ValueError(f"gap_months cannot be negative, got {gap_months}")
-
-    total = len(months)
-    if total <= test_months + gap_months:
-        raise ValueError(
-            f"Not enough history: {total} months available, but "
-            f"{test_months} test + {gap_months} gap months were requested, "
-            f"which leaves nothing to train on"
-        )
-
-    test_start = total - test_months
-    train_end = test_start - gap_months
+    # Same rule as the Spark feature build, so both cut at the same month.
+    train_end, test_start = cut_positions(len(months), test_share, gap_months)
     return months[:train_end], months[test_start:]
 
 
 def holdout_split(
     dataset: Dataset,
-    test_months: int,
+    test_share: float,
     gap_months: int = 0,
     name: str = "holdout",
 ) -> Split:
-    """Hold out the last ``test_months`` months of the panel as the test set.
+    """Hold out the last ``test_share`` of the panel's months as the test set.
 
     This is the split the headline number is reported on. It mimics the real
     situation exactly: fit on everything up to a date, predict the months that
@@ -260,8 +245,8 @@ def holdout_split(
     ----------
     dataset : Dataset
         The full panel.
-    test_months : int
-        How many months at the end to hold out.
+    test_share : float
+        Share of months at the end to hold out, between 0 and 1.
     gap_months : int, optional
         Months discarded between train and test. Default 0, which is correct
         while every feature is a lag over strictly earlier months.
@@ -280,7 +265,7 @@ def holdout_split(
         ends up with no rows.
     """
     times = month_values(dataset.times)
-    train_months, held_out = plan_month_cut(dataset.months, test_months, gap_months)
+    train_months, held_out = plan_month_cut(dataset.months, test_share, gap_months)
 
     split = Split(
         name=name,
@@ -608,8 +593,8 @@ class SplitSettings(BaseModel):
 
     Attributes
     ----------
-    test_months : int
-        Months held out at the end of the panel for the headline number.
+    test_share : float
+        Share of months held out at the end of the panel for the headline number.
     gap_months : int
         Months discarded between train and test. Zero is correct while every
         feature is a lag over strictly earlier months.
@@ -625,7 +610,7 @@ class SplitSettings(BaseModel):
     # silently leaves the default in place and changes every number reported.
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    test_months: int = Field(default=6, ge=1)
+    test_share: float = Field(default=0.2, gt=0, lt=1)
     gap_months: int = Field(default=0, ge=0)
     cv_folds: int = Field(default=4, ge=1)
     cv_test_months: int = Field(default=3, ge=1)
@@ -662,7 +647,7 @@ class SplitSettings(BaseModel):
         """
         gap = f", {self.gap_months}m gap" if self.gap_months else ""
         return (
-            f"holdout: last {self.test_months}m{gap}; "
+            f"holdout: last {self.test_share:.0%} of months{gap}; "
             f"cv: {self.cv_folds} expanding folds of {self.cv_test_months}m, "
             f"min train {self.min_train_months}m"
         )

@@ -1,8 +1,7 @@
 """Optuna search over model settings *and* training-target treatment.
 
-``tuning.py`` searches estimator hyperparameters with ``RandomizedSearchCV``,
-which can only vary what sits inside an sklearn estimator. The settings worth
-searching on this panel mostly do not: the cap on the training movement, the
+A ``RandomizedSearchCV`` can only vary what sits inside an sklearn estimator.
+The settings worth searching on this panel mostly do not: the cap on the training movement, the
 market scale for the 2024-07 regime shift and the recency weighting all change
 the *target a model is fitted to*, and have to be re-estimated inside every
 fold. Here each trial builds a whole model from a parameter dict and scores it
@@ -27,8 +26,7 @@ Two checks keep it honest: the winner is refitted on the ``seed_check`` seeds
 to show how much of its lead is seed noise, and the holdout -- which no trial
 reads -- is scored once, by ``src.test``, on the final model only.
 
-The space lives in the config next to the model it tunes, in the same shape as
-``tuning.py``'s: a list is a categorical choice (``null`` allowed), a mapping
+The space lives in the config next to the model it tunes: a list is a categorical choice (``null`` allowed), a mapping
 with ``low`` and ``high`` is a range, integer when both bounds are integers,
 log-uniform when ``log: true``.
 """

@@ -46,7 +46,8 @@ from src.evaluate import EvaluationReport, EvaluationSettings
 from src.importance import collect_importance, save_importance, top_features
 from src.log import console_level, setup_logging
 from src.metrics import Scores, anchor_values, score
-from src.models_code.base_class import AnchoredModel, Model
+from src.models_code.anchored_model import AnchoredModel
+from src.models_code.base_class import Model
 from src.models_code.xgboost_model import XGBoostModel
 from src.test import run as run_test
 from src.test import split_on_boundary, training_boundary
