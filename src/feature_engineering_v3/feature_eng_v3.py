@@ -2,9 +2,10 @@
 
 Third iteration of the Feature table (v3) and its segment tables.
 
-Reads v1, adds trailing-window features, assigns per-row segments and writes
-``fs_segment_types``, ``fs_segment_thresholds``, ``fs_segment_values`` and
-``features_monthly_v3``.
+Reads v1, adds trailing-window features, assigns segments and writes one lookup
+table per segmentation (``seg_sign_regime``, ``seg_size``, ``seg_behaviour``)
+plus ``features_monthly_v3``, which references them through ``*_id`` columns.
+The ``*_id`` columns are for routing and evaluation only, never model features.
 """
 
 from __future__ import annotations
@@ -20,7 +21,9 @@ if __package__ in (None, ""):
     # Run as a file, Python puts this folder on the path instead of the project root.
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+import psycopg2  # noqa: E402
 from loguru import logger  # noqa: E402
+from psycopg2 import sql  # noqa: E402
 from pydantic import BaseModel, ConfigDict  # noqa: E402
 from pyspark.sql import Column, DataFrame, SparkSession, Window  # noqa: E402
 from pyspark.sql import functions as F  # noqa: E402
@@ -34,19 +37,18 @@ from src.feature_engineering_v2.features_second import (  # noqa: E402
     safe_divide,
 )
 from src.log import setup_logging  # noqa: E402
-from src.month_cut import cut_positions  # noqa: E402
+from src.window import cut_positions  # noqa: E402
 
 SOURCE_TABLE = "feature_store_monthly"
 TARGET_TABLE = "features_monthly_v3"
-TYPES_TABLE = "fs_segment_types"
-THRESHOLDS_TABLE = "fs_segment_thresholds"
-VALUES_TABLE = "fs_segment_values"
 
 # Maven coordinate of the Postgres JDBC driver; Spark downloads it on the first run.
 POSTGRES_DRIVER = "org.postgresql:postgresql:42.7.7"
 
 ID_COLUMN = "user_id"
 TIME_COLUMN = "month"
+# Names the source table's month column may carry; the first one present is read and written back as TIME_COLUMN.
+SOURCE_TIME_COLUMNS = ("month", "date")
 TARGET_COLUMN = "target_closing_balance_usd"
 
 BALANCE = "prev_1m_closing_balance_usd"
@@ -86,6 +88,7 @@ DERIVED_COLUMNS: tuple[str, ...] = (
     "roll6_std_net_flow",
     "net_flow_cv",
     "change_volatility_6m",
+    "flow_volatility_6m",
     "eom_cv_6m",
     "share_neg_last_6m",
     "months_since_sign_flip",
@@ -97,98 +100,177 @@ DERIVED_COLUMNS: tuple[str, ...] = (
     "turnover_roll6",
 )
 
-SEGMENT_COLUMNS: tuple[str, ...] = (
-    "sign_regime_rank",
-    "size_rank",
-    "behaviour_rank",
-)
-
 WINDOW_MONTHS = 6
 DRAWDOWN_CAP = 2.0
 
+# Id 0 of every lookup table: rows with too little history or a missing basis value.
+UNASSIGNED_ID = 0
 UNASSIGNED = "unassigned"
-UNASSIGNED_RANK = 0
+UNASSIGNED_DESCRIPTION = "Too little history or a missing value to place the row; persistence is used."
 
-# Behaviour bands: calmest half, next 35%, most volatile 15% of training rows.
-BEHAVIOUR_QUANTILES = (0.5, 0.85)
-BEHAVIOUR_LABELS = ("stable", "moderate", "dynamic")
+SEGMENT_TABLE_SCHEMA = "id INT, category STRING, rule STRING, description STRING"
 
-SIZE_QUANTILES = (0.5, 0.9)
-SIZE_LABELS = ("smb", "mid", "enterprise")
+# Basis columns of the segmentations; their cut values live in the config under `segments`.
+SHARE_NEG = "share_neg_last_6m"
+DEBT_DEPTH = "debt_depth_6m"
+TURNOVER = "turnover_roll6"
+FLOW_VOLATILITY = "flow_volatility_6m"
 
-# Smallest segment the router will trust; smaller ones are only warned about here.
-MIN_ROWS_PER_SEGMENT = 100
+SIZE_CATEGORIES = (
+    ("low_turnover", "Little money moves through the account: mean monthly credited + |debited| over M-6..M-1."),
+    ("mid_turnover", "Typical monthly credited + |debited| over M-6..M-1."),
+    ("high_turnover", "Large monthly credited + |debited| over M-6..M-1."),
+)
+
+BEHAVIOUR_CATEGORIES = (
+    ("stable", "Net flow barely moves from month to month, relative to turnover."),
+    ("moderate", "Some month-to-month swing in net flow, relative to turnover."),
+    ("dynamic", "Large month-to-month swings in net flow, relative to turnover."),
+)
 
 
-class Band(BaseModel):
-    """One labelled interval ``lower < value <= upper`` of a segment basis.
+class Bound(BaseModel):
+    """One interval condition ``lower < column <= upper``.
 
     Attributes
     ----------
-    label : str
-        Segment label.
-    rank : int
-        Ordinal position of the label, used as a numeric feature.
+    column : str
+        Column the condition reads.
     lower : float or None
         Exclusive lower bound; None is unbounded.
     upper : float or None
         Inclusive upper bound; None is unbounded.
+    or_null : bool
+        Whether a null value also satisfies the condition.
     """
 
     model_config = ConfigDict(frozen=True)
 
-    label: str
-    rank: int
+    column: str
     lower: float | None = None
     upper: float | None = None
+    or_null: bool = False
+
+    def condition(self) -> Column:
+        """Return the Spark condition; a null value fails it unless ``or_null`` is set.
+
+        Returns
+        -------
+        pyspark.sql.Column
+            Boolean column.
+        """
+        value = F.col(self.column)
+        inside = value.isNotNull()
+        if self.lower is not None:
+            inside &= value > self.lower
+        if self.upper is not None:
+            inside &= value <= self.upper
+        return inside | value.isNull() if self.or_null else inside
+
+    def rule(self) -> str:
+        """Return the condition as readable text, e.g. ``5000 < turnover_roll6 <= 20000``.
+
+        Returns
+        -------
+        str
+            The rule.
+        """
+        if self.lower is not None and self.upper is not None:
+            text = f"{self.lower:g} < {self.column} <= {self.upper:g}"
+        elif self.lower is not None:
+            text = f"{self.column} > {self.lower:g}"
+        else:
+            text = f"{self.column} <= {self.upper:g}"
+        return f"({text} or {self.column} is null)" if self.or_null else text
 
 
-class SegmentDefinition(BaseModel):
-    """A segmentation kind: the column it reads and the bands it cuts it into.
+class Band(BaseModel):
+    """One category of a segmentation: a row belongs to it when every bound holds.
 
     Attributes
     ----------
-    segment_type_id : int
-        Key in ``fs_segment_types``.
-    name : str
-        Segmentation name, also the struct column it produces.
-    basis_column : str
-        Trailing-window column the bands are applied to.
+    id : int
+        Primary key in the lookup table and the value of the ``*_id`` column in v3.
+    category : str
+        Category name.
     description : str
-        Human-readable meaning, stored in ``fs_segment_types``.
-    bands : tuple of Band
-        Ordered intervals of the basis column.
-    window_months : int
-        Length of the trailing window the basis is computed over.
-    min_months : int
-        Rows with fewer months of history get ``short_history_label``.
-    short_history_label : str or None
-        Label used below ``min_months``; None means no override.
+        Human-readable meaning.
+    bounds : tuple of Bound
+        Conditions a row must satisfy.
     """
 
     model_config = ConfigDict(frozen=True)
 
-    segment_type_id: int
-    name: str
-    basis_column: str
+    id: int
+    category: str
     description: str
+    bounds: tuple[Bound, ...]
+
+    def condition(self) -> Column:
+        """Return the AND of every bound.
+
+        Returns
+        -------
+        pyspark.sql.Column
+            Boolean column.
+        """
+        return reduce(lambda left, right: left & right, (bound.condition() for bound in self.bounds))
+
+    def rule(self) -> str:
+        """Return the bounds as readable text joined by ``and``.
+
+        Returns
+        -------
+        str
+            The rule.
+        """
+        return " and ".join(bound.rule() for bound in self.bounds)
+
+
+class SegmentDefinition(BaseModel):
+    """A segmentation: its lookup table and the bands it places rows into.
+
+    Attributes
+    ----------
+    name : str
+        Segmentation name; v3 gets a ``{name}_id`` column.
+    table : str
+        Lookup table it is written to.
+    bands : tuple of Band
+        Categories, checked in order; the first match wins.
+    min_months : int
+        Rows with fewer months of history are unassigned.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    name: str
+    table: str
     bands: tuple[Band, ...]
-    window_months: int = WINDOW_MONTHS
     min_months: int = 1
-    short_history_label: str | None = None
 
+    @property
+    def id_column(self) -> str:
+        """Name of the column in v3 that references this table.
 
-SIGN_REGIME = SegmentDefinition(
-    segment_type_id=1,
-    name="sign_regime",
-    basis_column="share_neg_last_6m",
-    description="Share of negative month-end balances over M-6..M-1. Routes rows to a model.",
-    bands=(
-        Band(label="always_positive", rank=1, upper=0.1),
-        Band(label="oscillating", rank=2, lower=0.1, upper=0.9),
-        Band(label="always_negative", rank=3, lower=0.9),
-    ),
-)
+        Returns
+        -------
+        str
+            ``{name}_id``.
+        """
+        return f"{self.name}_id"
+
+    def rows(self) -> list[tuple[int, str, str, str]]:
+        """Return the lookup-table rows, unassigned first.
+
+        Returns
+        -------
+        list of tuple of (int, str, str, str)
+            ``(id, category, rule, description)`` per category.
+        """
+        history = "no prior month" if self.min_months == 1 else f"fewer than {self.min_months} months of history"
+        unassigned = (UNASSIGNED_ID, UNASSIGNED, f"{history}, or a missing basis value", UNASSIGNED_DESCRIPTION)
+        return [unassigned, *((band.id, band.category, band.rule(), band.description) for band in self.bands)]
 
 def create_session() -> SparkSession:
     """Start a local Spark session with the Postgres JDBC driver on the classpath.
@@ -245,10 +327,19 @@ def read_source(spark: SparkSession) -> DataFrame:
     -------
     pyspark.sql.DataFrame
         One row per user-month with a month index for range windows.
+
+    Raises
+    ------
+    ValueError
+        If the source table has none of ``SOURCE_TIME_COLUMNS``.
     """
     url, properties = jdbc_connection()
     raw = spark.read.jdbc(url, SOURCE_TABLE, properties=properties)
-    month = F.trunc(F.col(TIME_COLUMN).cast("date"), "month")
+    # The source has carried the month as both `month` and `date`, so read whichever exists.
+    source_time = next((name for name in SOURCE_TIME_COLUMNS if name in raw.columns), None)
+    if source_time is None:
+        raise ValueError(f"{SOURCE_TABLE} has none of the month columns {SOURCE_TIME_COLUMNS}")
+    month = F.trunc(F.col(source_time).cast("date"), "month")
     return raw.select(
         F.col(ID_COLUMN).cast("string").alias(ID_COLUMN),
         month.alias(TIME_COLUMN),
@@ -259,8 +350,8 @@ def read_source(spark: SparkSession) -> DataFrame:
     )
 
 
-def write_table(frame: DataFrame, table: str) -> None:
-    """Replace a Postgres table with the frame.
+def write_table(frame: DataFrame, table: str, primary_key: str | None = None) -> None:
+    """Replace a Postgres table with the frame, optionally adding a primary key.
 
     Parameters
     ----------
@@ -268,6 +359,8 @@ def write_table(frame: DataFrame, table: str) -> None:
         Rows to write.
     table : str
         Destination table name.
+    primary_key : str or None, optional
+        Column to make the primary key. Default None, no key.
 
     Returns
     -------
@@ -276,7 +369,42 @@ def write_table(frame: DataFrame, table: str) -> None:
     url, properties = jdbc_connection()
     # Overwrite, so rows from two versions of this script never sit side by side.
     frame.write.jdbc(url, table, mode="overwrite", properties=properties)
+    if primary_key is not None:
+        add_primary_key(table, primary_key)
     logger.info(f"Written  : {table}")
+
+
+def add_primary_key(table: str, column: str) -> None:
+    """Make a column the primary key of a table, which Spark's JDBC writer cannot do.
+
+    Parameters
+    ----------
+    table : str
+        Table to alter.
+    column : str
+        Key column.
+
+    Returns
+    -------
+    None
+    """
+    env = os.environ
+    connection = psycopg2.connect(
+        host=env["POSTGRES_HOST"],
+        port=env["POSTGRES_PORT"],
+        dbname=env["POSTGRES_DB"],
+        user=env["POSTGRES_USER"],
+        password=env["POSTGRES_PASSWORD"],
+    )
+    statement = sql.SQL("ALTER TABLE {} ADD PRIMARY KEY ({})").format(
+        sql.Identifier(table), sql.Identifier(column)
+    )
+    try:
+        # The `with connection` block commits on success and rolls back on error.
+        with connection, connection.cursor() as cursor:
+            cursor.execute(statement)
+    finally:
+        connection.close()
 
 
 def _trailing(months: int) -> WindowSpec:
@@ -393,26 +521,29 @@ def _add_flow_volatility(frame: DataFrame) -> DataFrame:
 
 
 def _add_income(frame: DataFrame) -> DataFrame:
-    """Add turnover, income volatility and the repayment ratio over 6 months.
+    """Add turnover, flow volatility, income volatility and the repayment ratio over 6 months.
 
     Parameters
     ----------
     frame : pyspark.sql.DataFrame
-        Frame to extend.
+        Frame to extend; needs ``roll6_std_net_flow``.
 
     Returns
     -------
     pyspark.sql.DataFrame
-        With ``turnover_roll6``, ``income_cv_6m`` and ``repayment_ratio``.
+        With ``turnover_roll6``, ``flow_volatility_6m``, ``income_cv_6m`` and ``repayment_ratio``.
     """
     window = _trailing(WINDOW_MONTHS)
     credited = F.col(CREDITED)
     # Absolute value, so the result holds whichever sign v1 stores debits with.
     debited = F.abs(F.col(DEBITED))
     mean_credited = F.avg(credited).over(window)
+    turnover = F.avg(credited + debited).over(window)
     return frame.withColumns(
         {
-            "turnover_roll6": F.avg(credited + debited).over(window),
+            "turnover_roll6": turnover,
+            # Net-flow spread per dollar of turnover; unlike change_volatility_6m it stays finite near a zero balance.
+            "flow_volatility_6m": safe_divide(F.col("roll6_std_net_flow"), turnover),
             "income_cv_6m": safe_divide(F.stddev_samp(credited).over(window), F.abs(mean_credited)),
             "repayment_ratio": safe_divide(mean_credited, F.avg(debited).over(window)),
         }
@@ -502,7 +633,7 @@ def add_window_features(frame: DataFrame) -> DataFrame:
     pyspark.sql.DataFrame
         The same rows with the derived and helper columns added.
     """
-    # Income runs before sign/debt because debt depth divides by turnover.
+    # Flow volatility runs before income, and income before sign/debt, since each divides by the previous one's output.
     builders = (_add_trend, _add_change, _add_flow_volatility, _add_income, _add_sign_debt)
     return reduce(lambda built, builder: builder(built), builders, frame)
 
@@ -530,236 +661,184 @@ def training_cutoff(frame: DataFrame, config: dict[str, Any]) -> date:
     return months[train_end - 1]
 
 
-def quantile_bands(
-    training: DataFrame,
+def threshold_bands(
     column: str,
-    labels: tuple[str, ...],
-    ranks: tuple[int, ...],
-    quantiles: tuple[float, ...],
+    cuts: list[float],
+    categories: tuple[tuple[str, str], ...],
 ) -> tuple[Band, ...]:
-    """Cut a column into bands at exact quantiles of the training rows.
+    """Cut a column into bands at fixed values.
 
     Parameters
     ----------
-    training : pyspark.sql.DataFrame
-        Training-month rows only.
     column : str
         Column to cut.
-    labels : tuple of str
-        One label per band, lowest first.
-    ranks : tuple of int
-        One rank per band.
-    quantiles : tuple of float
-        Cut points, one fewer than labels.
+    cuts : list of float
+        Ascending cut values, one fewer than categories.
+    categories : tuple of (str, str)
+        ``(category, description)`` per band, lowest first; ids run from 1.
 
     Returns
     -------
     tuple of Band
         The bands, lowest first.
+
+    Raises
+    ------
+    ValueError
+        If the cuts are not ascending or do not match the number of categories.
     """
-    # relativeError 0 gives exact quantiles, which is cheap at this table size.
-    cuts = training.approxQuantile(column, list(quantiles), 0.0)
+    if len(cuts) != len(categories) - 1 or list(cuts) != sorted(cuts):
+        raise ValueError(f"{column}: need {len(categories) - 1} ascending cuts, got {cuts}")
     edges: list[float | None] = [None, *cuts, None]
     return tuple(
-        Band(label=label, rank=rank, lower=edges[i], upper=edges[i + 1])
-        for i, (label, rank) in enumerate(zip(labels, ranks))
+        Band(
+            id=i + 1,
+            category=category,
+            description=description,
+            bounds=(Bound(column=column, lower=edges[i], upper=edges[i + 1]),),
+        )
+        for i, (category, description) in enumerate(categories)
     )
 
 
-def build_definitions(frame: DataFrame, cutoff: date) -> tuple[SegmentDefinition, ...]:
-    """Return the three segmentations, with quantile cuts taken on training months only.
+def sign_regime_bands(negative_share: float, debt_depth_months: float) -> tuple[Band, ...]:
+    """Return the sign regime bands: not always negative, then always negative split by debt depth.
 
     Parameters
     ----------
-    frame : pyspark.sql.DataFrame
-        Frame with the derived columns.
-    cutoff : datetime.date
-        Last training month.
+    negative_share : float
+        Share of negative months above which a row counts as always negative.
+    debt_depth_months : float
+        Deepest debt, in months of turnover, splitting shallow from deep.
+
+    Returns
+    -------
+    tuple of Band
+        Not always negative, shallow negative and deep negative.
+    """
+    negative = Bound(column=SHARE_NEG, lower=negative_share)
+    return (
+        Band(
+            id=1,
+            category="not_always_negative",
+            description="Balance is at or above zero in at least some of M-6..M-1.",
+            bounds=(Bound(column=SHARE_NEG, upper=negative_share),),
+        ),
+        Band(
+            id=2,
+            category="shallow_negative",
+            description="Almost always negative; deepest debt is small relative to monthly turnover.",
+            bounds=(negative, Bound(column=DEBT_DEPTH, upper=debt_depth_months)),
+        ),
+        Band(
+            id=3,
+            category="deep_negative",
+            description="Almost always negative; deepest debt is large relative to monthly turnover, or turnover is too small to measure it.",
+            # Null depth means turnover is near zero, so any debt is deep relative to it.
+            bounds=(negative, Bound(column=DEBT_DEPTH, lower=debt_depth_months, or_null=True)),
+        ),
+    )
+
+
+def build_definitions(settings: dict[str, Any]) -> tuple[SegmentDefinition, ...]:
+    """Return the three segmentations with the fixed cuts from the config.
+
+    Parameters
+    ----------
+    settings : dict
+        The config's ``segments`` block.
 
     Returns
     -------
     tuple of SegmentDefinition
         ``(sign_regime, size, behaviour)``.
+
+    Raises
+    ------
+    KeyError
+        If a cut is missing from the config.
+    ValueError
+        If the size or behaviour cuts are malformed.
     """
-    training = frame.filter(F.col(TIME_COLUMN) <= F.lit(cutoff))
+    sign = settings["sign_regime"]
+    sign_regime = SegmentDefinition(
+        name="sign_regime",
+        table="seg_sign_regime",
+        bands=sign_regime_bands(float(sign["negative_share"]), float(sign["debt_depth_months"])),
+    )
     size = SegmentDefinition(
-        segment_type_id=2,
         name="size",
-        basis_column="turnover_roll6",
-        description="Mean monthly credited + |debited| over M-6..M-1; cuts at training q50/q90.",
-        bands=quantile_bands(training, "turnover_roll6", SIZE_LABELS, (1, 2, 3), SIZE_QUANTILES),
+        table="seg_size",
+        bands=threshold_bands(TURNOVER, settings["size"]["turnover"], SIZE_CATEGORIES),
     )
     behaviour = SegmentDefinition(
-        segment_type_id=3,
         name="behaviour",
-        basis_column="change_volatility_6m",
-        description="Spread of monthly net flow over M-6..M-1 relative to the balance; cuts at training q50/q85.",
-        bands=quantile_bands(
-            training, "change_volatility_6m", BEHAVIOUR_LABELS, (1, 2, 3), BEHAVIOUR_QUANTILES
+        table="seg_behaviour",
+        bands=threshold_bands(
+            FLOW_VOLATILITY, settings["behaviour"]["flow_volatility"], BEHAVIOUR_CATEGORIES
         ),
-        min_months=3,
-        short_history_label="stable",
+        min_months=int(settings["behaviour"]["min_months"]),
     )
-    return SIGN_REGIME, size, behaviour
-
-
-def _segment(label: str, rank: int) -> Column:
-    """Build a ``struct(label, rank)`` literal.
-
-    Parameters
-    ----------
-    label : str
-        Segment label.
-    rank : int
-        Segment rank.
-
-    Returns
-    -------
-    pyspark.sql.Column
-        The struct.
-    """
-    return F.struct(F.lit(label).alias("label"), F.lit(rank).alias("rank"))
-
-
-def band_of(value: Column, bands: tuple[Band, ...]) -> Column:
-    """Return the ``struct(label, rank)`` of the band that holds the value.
-
-    Parameters
-    ----------
-    value : pyspark.sql.Column
-        Basis value.
-    bands : tuple of Band
-        Bands to test, in order.
-
-    Returns
-    -------
-    pyspark.sql.Column
-        The matching struct, null when the value is null or outside every band.
-    """
-    chosen: Column = F.lit(None)
-    # Built from the last band backwards, so the first matching band wins.
-    for band in reversed(bands):
-        inside = value.isNotNull()
-        if band.lower is not None:
-            inside &= value > band.lower
-        if band.upper is not None:
-            inside &= value <= band.upper
-        chosen = F.when(inside, _segment(band.label, band.rank)).otherwise(chosen)
-    return chosen
+    return sign_regime, size, behaviour
 
 
 def assign_segments(frame: DataFrame, definition: SegmentDefinition) -> DataFrame:
-    """Add a ``struct(label, rank)`` column named after the segmentation.
+    """Add the ``{name}_id`` column holding the id of the first band each row satisfies.
 
     Parameters
     ----------
     frame : pyspark.sql.DataFrame
-        Frame with the basis column and the months of history.
+        Frame with the basis columns and the months of history.
     definition : SegmentDefinition
         Segmentation to apply.
 
     Returns
     -------
     pyspark.sql.DataFrame
-        With the segment column; ``unassigned`` for rows with no prior month.
+        With the id column; ``UNASSIGNED_ID`` for short history or no matching band.
     """
-    unassigned = _segment(UNASSIGNED, UNASSIGNED_RANK)
-    segment = F.coalesce(band_of(F.col(definition.basis_column), definition.bands), unassigned)
-    if definition.short_history_label is not None:
-        fallback = next(band for band in definition.bands if band.label == definition.short_history_label)
-        segment = F.when(
-            F.col(HISTORY) < definition.min_months, _segment(fallback.label, fallback.rank)
-        ).otherwise(segment)
-    return frame.withColumn(definition.name, F.when(F.col(HISTORY) > 0, segment).otherwise(unassigned))
+    chosen: Column = F.lit(UNASSIGNED_ID)
+    # Built from the last band backwards, so the first matching band wins.
+    for band in reversed(definition.bands):
+        chosen = F.when(band.condition(), F.lit(band.id)).otherwise(chosen)
+    enough_history = F.col(HISTORY) >= definition.min_months
+    return frame.withColumn(
+        definition.id_column, F.when(enough_history, chosen).otherwise(F.lit(UNASSIGNED_ID))
+    )
 
 
-def segment_types(spark: SparkSession, definitions: tuple[SegmentDefinition, ...]) -> DataFrame:
-    """Build the ``fs_segment_types`` rows.
+def segment_table(spark: SparkSession, definition: SegmentDefinition) -> DataFrame:
+    """Build a segmentation's lookup table: ``id, category, rule, description``.
 
     Parameters
     ----------
     spark : pyspark.sql.SparkSession
         Session to build with.
-    definitions : tuple of SegmentDefinition
-        The segmentations.
+    definition : SegmentDefinition
+        The segmentation.
 
     Returns
     -------
     pyspark.sql.DataFrame
-        One row per segmentation kind.
+        One row per category, unassigned included.
     """
-    rows = [
-        (d.segment_type_id, d.name, d.basis_column, d.window_months, d.description)
-        for d in definitions
-    ]
-    schema = "segment_type_id INT, name STRING, basis_column STRING, window_months INT, description STRING"
-    return spark.createDataFrame(rows, schema)
+    return spark.createDataFrame(definition.rows(), SEGMENT_TABLE_SCHEMA)
 
 
-def segment_thresholds(spark: SparkSession, definitions: tuple[SegmentDefinition, ...]) -> DataFrame:
-    """Build the ``fs_segment_thresholds`` rows, where each band is ``lower < x <= upper``.
-
-    Parameters
-    ----------
-    spark : pyspark.sql.SparkSession
-        Session to build with.
-    definitions : tuple of SegmentDefinition
-        The segmentations.
-
-    Returns
-    -------
-    pyspark.sql.DataFrame
-        One row per band.
-    """
-    rows = [
-        (d.segment_type_id, band.label, band.rank, band.lower, band.upper)
-        for d in definitions
-        for band in d.bands
-    ]
-    schema = "segment_type_id INT, label STRING, rank INT, lower DOUBLE, upper DOUBLE"
-    return spark.createDataFrame(rows, schema)
-
-
-def segment_values(frame: DataFrame, definitions: tuple[SegmentDefinition, ...]) -> DataFrame:
-    """Build the ``fs_segment_values`` rows: one per user, month and segmentation.
-
-    Parameters
-    ----------
-    frame : pyspark.sql.DataFrame
-        Frame with one struct column per segmentation.
-    definitions : tuple of SegmentDefinition
-        The segmentations to unpivot.
-
-    Returns
-    -------
-    pyspark.sql.DataFrame
-        Long table of ``user_id, month, segment_type_id, label, rank``.
-    """
-    parts = [
-        frame.select(
-            ID_COLUMN,
-            TIME_COLUMN,
-            F.lit(d.segment_type_id).alias("segment_type_id"),
-            F.col(f"{d.name}.label").alias("label"),
-            F.col(f"{d.name}.rank").alias("rank"),
-        )
-        for d in definitions
-    ]
-    return reduce(DataFrame.unionByName, parts)
-
-
-def feature_table(frame: DataFrame) -> DataFrame:
+def feature_table(frame: DataFrame, definitions: tuple[SegmentDefinition, ...]) -> DataFrame:
     """Select the v3 columns in table order.
 
     Parameters
     ----------
     frame : pyspark.sql.DataFrame
-        Frame with derived columns and segment structs.
+        Frame with derived columns and segment ids.
+    definitions : tuple of SegmentDefinition
+        The segmentations whose id columns are kept.
 
     Returns
     -------
     pyspark.sql.DataFrame
-        Keys, target, kept v1 columns, derived columns and segment refs.
+        Keys, target, kept v1 columns, derived columns and segment ids.
     """
     return frame.select(
         ID_COLUMN,
@@ -767,14 +846,12 @@ def feature_table(frame: DataFrame) -> DataFrame:
         TARGET_COLUMN,
         *V1_FEATURES,
         *DERIVED_COLUMNS,
-        F.col("sign_regime.rank").alias("sign_regime_rank"),
-        F.col("size.rank").alias("size_rank"),
-        F.col("behaviour.rank").alias("behaviour_rank"),
+        *(d.id_column for d in definitions),
     )
 
 
-def log_thresholds(definitions: tuple[SegmentDefinition, ...]) -> None:
-    """Log every band so the fitted cuts are visible in the run log.
+def log_segment_tables(definitions: tuple[SegmentDefinition, ...]) -> None:
+    """Log every lookup-table row so the cuts are visible in the run log.
 
     Parameters
     ----------
@@ -785,47 +862,61 @@ def log_thresholds(definitions: tuple[SegmentDefinition, ...]) -> None:
     -------
     None
     """
-    logger.info("\nThresholds (lower < x <= upper):")
     for d in definitions:
-        for band in d.bands:
-            logger.info(f"  {d.name:<24} {band.label:<16} ({band.lower}, {band.upper}]")
+        logger.info(f"\n{d.table}:")
+        for row_id, category, rule, _ in d.rows():
+            logger.info(f"  {row_id}  {category:<18} {rule}")
 
 
-def log_segment_counts(values: DataFrame, definitions: tuple[SegmentDefinition, ...], cutoff: date) -> None:
-    """Log rows per segment in train and holdout, warning below ``MIN_ROWS_PER_SEGMENT``.
+def log_segment_counts(
+    frame: DataFrame, definitions: tuple[SegmentDefinition, ...], cutoff: date, min_rows: int
+) -> None:
+    """Log rows and shares per category in train and holdout, warning below ``min_rows``.
 
     Parameters
     ----------
-    values : pyspark.sql.DataFrame
-        The ``fs_segment_values`` rows.
+    frame : pyspark.sql.DataFrame
+        Frame with the segment id columns.
     definitions : tuple of SegmentDefinition
-        The segmentations, used for their names.
+        The segmentations.
     cutoff : datetime.date
         Last training month.
+    min_rows : int
+        Smallest category the router will trust.
 
     Returns
     -------
     None
     """
-    names = {d.segment_type_id: d.name for d in definitions}
-    region = F.when(F.col(TIME_COLUMN) <= F.lit(cutoff), "train").otherwise("holdout")
-    counts = (
-        values.withColumn("region", region)
-        .groupBy("segment_type_id", "rank", "label")
-        .pivot("region", ["train", "holdout"])
-        .count()
-        .orderBy("segment_type_id", "rank")
-        .collect()
+    regions = frame.withColumn(
+        "region", F.when(F.col(TIME_COLUMN) <= F.lit(cutoff), "train").otherwise("holdout")
     )
     logger.info(f"\nRows per segment (train <= {cutoff}):")
-    for row in counts:
-        train, holdout = row["train"] or 0, row["holdout"] or 0
-        line = f"  {names[row['segment_type_id']]:<12} {row['label']:<16} train {train:>5}  holdout {holdout:>5}"
-        # Unassigned rows always go to persistence, so their size does not matter.
-        if row["label"] != UNASSIGNED and min(train, holdout) < MIN_ROWS_PER_SEGMENT:
-            logger.warning(f"{line}  < {MIN_ROWS_PER_SEGMENT}: router falls back to persistence")
-        else:
-            logger.info(line)
+    for d in definitions:
+        categories = {row_id: category for row_id, category, _, _ in d.rows()}
+        counts = (
+            regions.groupBy(d.id_column)
+            .pivot("region", ["train", "holdout"])
+            .count()
+            .fillna(0)
+            .orderBy(d.id_column)
+            .collect()
+        )
+        # Totals per region, so each share shows how the cuts land on train versus holdout.
+        train_total = sum(row["train"] for row in counts) or 1
+        holdout_total = sum(row["holdout"] for row in counts) or 1
+        for row in counts:
+            row_id, train, holdout = row[d.id_column], row["train"], row["holdout"]
+            line = (
+                f"  {d.name:<12} {categories[row_id]:<20}"
+                f" train {train:>5} ({100 * train / train_total:5.1f}%)"
+                f"  holdout {holdout:>5} ({100 * holdout / holdout_total:5.1f}%)"
+            )
+            # Unassigned rows always go to persistence, so their size does not matter.
+            if row_id != UNASSIGNED_ID and min(train, holdout) < min_rows:
+                logger.warning(f"{line}  < {min_rows}: router falls back to persistence")
+            else:
+                logger.info(line)
 
 
 def log_null_shares(frame: DataFrame) -> None:
@@ -849,7 +940,7 @@ def log_null_shares(frame: DataFrame) -> None:
 
 
 def run(config: dict[str, Any]) -> None:
-    """Build the segment tables and ``features_monthly_v3`` and write them to Postgres.
+    """Build the segment lookup tables and ``features_monthly_v3`` and write them to Postgres.
 
     Parameters
     ----------
@@ -864,22 +955,22 @@ def run(config: dict[str, Any]) -> None:
     try:
         # Cached, because every later step re-reads the windowed frame.
         featured = add_window_features(read_source(spark)).cache()
+        # The cutoff only splits the logged counts; the segment cuts are fixed in the config.
         cutoff = training_cutoff(featured, config)
         logger.info(f"Training months end at {cutoff}")
 
-        segmentations = build_definitions(featured, cutoff)
+        segment_settings = config["segments"]
+        segmentations = build_definitions(segment_settings)
         segmented = reduce(assign_segments, segmentations, featured).cache()
 
-        values = segment_values(segmented, segmentations)
-        v3 = feature_table(segmented)
-        log_thresholds(segmentations)
-        log_segment_counts(values, segmentations, cutoff)
+        v3 = feature_table(segmented, segmentations)
+        log_segment_tables(segmentations)
+        log_segment_counts(segmented, segmentations, cutoff, int(segment_settings["min_rows"]))
         log_null_shares(v3)
         logger.info(f"\n{TARGET_TABLE}: {v3.count():,} rows, {len(v3.columns)} columns")
 
-        write_table(segment_types(spark, segmentations), TYPES_TABLE)
-        write_table(segment_thresholds(spark, segmentations), THRESHOLDS_TABLE)
-        write_table(values, VALUES_TABLE)
+        for definition in segmentations:
+            write_table(segment_table(spark, definition), definition.table, primary_key="id")
         write_table(v3, TARGET_TABLE)
     finally:
         spark.stop()

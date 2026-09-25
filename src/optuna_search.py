@@ -1,12 +1,8 @@
-"""Optuna search over model settings *and* training-target treatment.
+"""Optuna search over model settings.
 
-A ``RandomizedSearchCV`` can only vary what sits inside an sklearn estimator.
-The settings worth searching on this panel mostly do not: the cap on the training movement, the
-market scale for the 2024-07 regime shift and the recency weighting all change
-the *target a model is fitted to*, and have to be re-estimated inside every
-fold. Here each trial builds a whole model from a parameter dict and scores it
-on the same expanding month folds ``train.py`` cross-validates on, so anything
-a model constructor accepts can be searched.
+Each trial builds a whole model from a parameter dict and scores it on the same
+expanding month folds ``train.py`` cross-validates on, so anything a model
+constructor accepts can be searched.
 
 **The objective is a ratio against persistence, fold by fold.** Each fold's
 MAE is divided by persistence's MAE on the same rows, and the ratios are
@@ -286,8 +282,7 @@ def run_study(
         try:
             maes, ratios = fold_ratios(build, params, narrow, train, folds, reference_mae)
         except ValueError as error:
-            # An incompatible pair the space allows (clip on a level target,
-            # say). Recorded as pruned so the study shows it, not fatal.
+            # A parameter combination the model rejects. Recorded as pruned so the study shows it, not fatal.
             trial.set_user_attr("error", str(error))
             raise optuna.TrialPruned(str(error)) from error
         trial.set_user_attr("fold_mae", maes.round(2).tolist())

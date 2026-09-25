@@ -24,25 +24,13 @@ from typing import Any
 import numpy as np
 import numpy.typing as npt
 import pandas as pd
-from loguru import logger
 from sklearn.impute import SimpleImputer
-from sklearn.linear_model import Ridge, RidgeCV
+from sklearn.linear_model import Ridge
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
 from src.data.data import Dataset
 from src.models_code.anchored_model import AnchoredModel
-from src.window import MonthlyExpandingSplit
-
-# Spans nine orders of magnitude so the CV curve has a genuine interior minimum
-# to find rather than being pinned at an end. The top matters here: with the
-# balance lags as correlated as they are, a first run capped at 1e3 chose 1e3 --
-# the boundary, which means the search wanted more penalty than it was offered
-# and the value it reported was the grid's edge, not an answer. A chosen alpha
-# still sitting at either end is the signal to widen this again.
-DEFAULT_ALPHAS: tuple[float, ...] = (
-    0.01, 0.1, 1.0, 10.0, 100.0, 1_000.0, 10_000.0, 100_000.0, 1_000_000.0,
-)
 
 
 class RidgeRegression(AnchoredModel):
@@ -54,86 +42,105 @@ class RidgeRegression(AnchoredModel):
         Label for result tables. Default ``ridge``.
     anchor_column : str, optional
         Column holding last month's balance.
-    alpha : float, optional
-        Fixed regularisation strength. Ignored when ``alphas`` is given, which
-        is the default -- set this only to pin a value and skip the inner CV.
-    alphas : sequence of float, optional
-        Candidates for ``RidgeCV``. Default :data:`DEFAULT_ALPHAS`. Pass None to
-        use the fixed ``alpha`` instead.
+    alpha : float
+        Regularisation strength, from Optuna or the config's ``params``.
     impute_strategy : str, optional
         Passed to ``SimpleImputer``. Default ``median``: the money columns are
         skewed enough that a mean fill would insert values no user ever held.
     random_state : int, optional
         Accepted for interface symmetry with the booster. Ridge is
         deterministic, so it changes nothing.
-    clip, market_scale, recency_half_life : optional
-        Training-target treatment, see ``AnchoredModel``.
 
     Attributes
     ----------
     best_params_ : dict or None
-        ``{"alpha": ...}`` once fitted through ``RidgeCV``.
+        ``{"alpha": ...}`` once fitted.
+
+    Raises
+    ------
+    ValueError
+        If ``alpha`` is not set.
     """
 
     def __init__(
         self,
         name: str = "ridge",
         anchor_column: str = "prev_1m_closing_balance_usd",
-        alpha: float = 1.0,
-        alphas: tuple[float, ...] | None = DEFAULT_ALPHAS,
+        alpha: float | None = None,
         impute_strategy: str = "median",
         random_state: int = 42,
-        clip: float | str | None = None,
-        market_scale: bool = False,
-        recency_half_life: float | None = None,
     ) -> None:
-        super().__init__(
-            name,
-            anchor_column=anchor_column,
-            clip=clip,
-            market_scale=market_scale,
-            recency_half_life=recency_half_life,
-        )
+        super().__init__(name, anchor_column=anchor_column)
+        # Empty means the search has not been run yet, so say so instead of fitting a guess.
+        if alpha is None:
+            raise ValueError(self._unset_message(name, "alpha"))
         self.alpha = alpha
-        self.alphas = tuple(alphas) if alphas else None
         self.impute_strategy = impute_strategy
         self.random_state = random_state
 
         # Populated by _fit.
         self._pipeline: Pipeline | None = None
 
-    def _build_pipeline(self, folds: Any = None) -> Pipeline:
-        """Return the unfitted impute -> scale -> ridge pipeline.
+    @staticmethod
+    def _unset_message(name: str, params: str) -> str:
+        """Return the error text for penalty settings left empty in the config.
 
         Parameters
         ----------
-        folds : list of (numpy.ndarray, numpy.ndarray), optional
-            Month-aware folds for the inner alpha search. When omitted,
-            ``RidgeCV`` falls back to its own efficient leave-one-out, which is
-            fine for choosing a scalar but is not month-aware -- so the caller
-            passes folds whenever it has them.
+        name : str
+            The model's name.
+        params : str
+            The unset settings, e.g. ``alpha`` or ``alpha / l1_ratio``.
+
+        Returns
+        -------
+        str
+            What is empty and how to fill it.
+        """
+        return (
+            f"{name}: {params} not set. Run with optuna.enabled: true, then paste "
+            f"best_params from {name}_best_params.json into this model's params "
+            f"in the config."
+        )
+
+    def _build_estimator(self) -> Any:
+        """Return the unfitted linear estimator with the configured penalty.
+
+        Returns
+        -------
+        sklearn.linear_model.Ridge
+            Unfitted.
+        """
+        return Ridge(alpha=self.alpha)
+
+    def _penalty_params(self) -> dict[str, float]:
+        """Return the penalty settings this model fits with.
+
+        Returns
+        -------
+        dict
+            ``{"alpha": ...}``.
+        """
+        return {"alpha": float(self.alpha)}
+
+    def _build_pipeline(self) -> Pipeline:
+        """Return the unfitted impute -> scale -> regressor pipeline.
 
         Returns
         -------
         sklearn.pipeline.Pipeline
             Unfitted.
         """
-        estimator: Any
-        if self.alphas:
-            estimator = RidgeCV(alphas=self.alphas, cv=folds)
-        else:
-            estimator = Ridge(alpha=self.alpha)
-
         return Pipeline(
             [
                 ("impute", SimpleImputer(strategy=self.impute_strategy)),
                 ("scale", StandardScaler()),
-                ("ridge", estimator),
+                ("regressor", self._build_estimator()),
             ]
         )
 
     def _fit(self, dataset: Dataset) -> None:
-        """Fit the pipeline, choosing alpha by cross-validation.
+        """Fit the pipeline on the rows that have a target.
 
         Parameters
         ----------
@@ -155,61 +162,10 @@ class RidgeRegression(AnchoredModel):
         features = dataset.features.loc[usable]
         values = target.to_numpy(dtype="float64")[usable]
 
-        # Folds are built from the surviving rows' months, not the dataset's, or
-        # the index pairs would not line up with the matrix being fitted.
-        folds = self._inner_folds(dataset, usable)
-
-        weights = self._training_weights(dataset)
-        fit_params = {} if weights is None else {"ridge__sample_weight": weights[usable]}
-
-        self._pipeline = self._build_pipeline(folds)
-        self._pipeline.fit(features, values, **fit_params)
-
-        chosen = self._pipeline.named_steps["ridge"]
-        if hasattr(chosen, "alpha_"):
-            picked = float(chosen.alpha_)
-            self.best_params_ = {"alpha": picked}
-            # An alpha at either end of the grid is not a choice, it is the
-            # search running out of room, and the two ends mean opposite things.
-            # Said out loud rather than left in the summary for someone to spot.
-            if self.alphas and picked >= max(self.alphas):
-                logger.warning(
-                    f"  {self.name}: alpha settled on {picked:g}, the top of the "
-                    f"grid -- cross-validation wants every coefficient at zero, "
-                    f"so this model is predicting the mean movement and nothing "
-                    f"else. Widening the grid will not change that; it is a "
-                    f"finding about the features, not about alpha."
-                )
-            elif self.alphas and picked <= min(self.alphas):
-                logger.warning(
-                    f"  {self.name}: alpha settled on {picked:g}, the bottom of "
-                    f"the grid -- the fit wants less penalty than it was "
-                    f"offered. Widen DEFAULT_ALPHAS downward in ridge_reg.py."
-                )
-        else:
-            self.best_params_ = {"alpha": float(self.alpha)}
-
-    def _inner_folds(self, dataset: Dataset, usable: npt.NDArray[np.bool_]) -> Any:
-        """Return month-aware folds for the alpha search, or None.
-
-        Parameters
-        ----------
-        dataset : Dataset
-            Training rows, before the usable-target filter.
-        usable : numpy.ndarray of bool
-            Mask of rows that survive into the fit.
-
-        Returns
-        -------
-        list or None
-            Fold index pairs, or None when the training region is too short to
-            produce any -- in which case ``RidgeCV`` uses leave-one-out.
-        """
-        months = dataset.frame[dataset.time_column].loc[usable].reset_index(drop=True)
-        splitter = MonthlyExpandingSplit(n_folds=3, test_months=3)
-        # X is only used for its length; the months go in as groups.
-        folds = list(splitter.split(np.empty((len(months), 1)), groups=months))
-        return folds or None
+        self._pipeline = self._build_pipeline()
+        self._pipeline.fit(features, values)
+        # Recorded so train.py saves and logs the settings like any tuned model.
+        self.best_params_ = self._penalty_params()
 
     def _predict(self, dataset: Dataset) -> npt.NDArray[np.float64]:
         """Predict the change and turn it back into a balance.
@@ -251,7 +207,7 @@ class RidgeRegression(AnchoredModel):
             return None
 
         coefficients = np.abs(
-            np.asarray(self._pipeline.named_steps["ridge"].coef_, dtype="float64")
+            np.asarray(self._pipeline.named_steps["regressor"].coef_, dtype="float64")
         )
         if coefficients.shape[0] != len(self._feature_columns):
             # The imputer can drop an all-NaN column, which would misalign the
@@ -274,8 +230,7 @@ class RidgeRegression(AnchoredModel):
         """
         if not self.is_fitted:
             return f"{self.name} (not fitted)"
-        alpha = (self.best_params_ or {}).get("alpha", self.alpha)
         return (
-            f"{self.name}: ridge alpha={alpha:g}, "
+            f"{self.name}: ridge alpha={self.alpha:g}, "
             f"{len(self._feature_columns)} features"
         )

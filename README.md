@@ -201,7 +201,6 @@ src/metrics.py                    scoring, and the two framings to read it in
 src/evaluate.py                   breakdowns by month, user and account tier
 src/optuna_search.py              Optuna study on the CV folds, writes *_best_params.json
 src/importance.py                 gain and coefficient rankings
-src/month_cut.py                  the train/holdout month cut (pure Python)
 src/feature_engineering_v3/       v3 features and segment tables (PySpark)
 src/models_code/base_class.py     the Model interface, save/load
 src/models_code/exceptions.py     NotFittedError

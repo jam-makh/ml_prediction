@@ -256,8 +256,6 @@ def report_tuning_and_importance(models: dict[str, Model], config: dict[str, Any
             )
             for key, value in (record.get("best_params") or {}).items():
                 logger.info(f"    {key:<22} {value}")
-            if model.clip_cap_ is not None:
-                logger.info(f"    {'clip cap (fitted)':<22} {model.clip_cap_:,.0f}")
 
     table = collect_importance(
         {name: model for name, model in models.items() if isinstance(model, AnchoredModel)}

@@ -78,6 +78,7 @@ from src.metrics import Scores, anchor_values, score
 from src.models_code.anchored_model import AnchoredModel
 from src.models_code.base_class import Model
 from src.models_code.baseline import LagAverageBaseline
+from src.models_code.elastic_net import ElasticNetRegression
 from src.models_code.ridge_reg import RidgeRegression
 from src.models_code.xgboost_model import XGBoostModel
 from src.optuna_search import reference_fold_mae, run_study
@@ -88,16 +89,10 @@ from src.window import (
     holdout_split,
 )
 
-# Every model kind a config may name, mapped to its constructor. Order here is
-# the order of the work: the trivial predictor to set the bar, a linear model
-# that can be explained to a stakeholder, and boosted trees only if they beat it
-# by enough to justify losing that explanation.
-#
-# `lag_average` covers both baselines -- three_month_average and persistence are
-# the same class with a different n_months, set in the config.
 MODEL_REGISTRY: dict[str, Callable[..., Model]] = {
     "lag_average": LagAverageBaseline,
     "ridge": RidgeRegression,
+    "elastic_net": ElasticNetRegression,
     "xgboost": XGBoostModel,
 }
 
@@ -112,13 +107,11 @@ RUN_DEFAULTS = ("random_state", "anchor_column")
 # A model is rebuilt for every fold, so a zero-argument factory is passed around instead of an instance.
 ModelFactory = Callable[[], Model]
 
-# Which `data.drop_columns` list each model kind reads. Before this existed the
-# dataset was built once with `default_drop_columns`, so every model got the
-# same list: dropping a column "for xgboost" silently dropped it for ridge too,
-# and the ridge list was never read at all.
 FAMILY_BY_KIND: dict[str, str] = {
     "lag_average": "mean",
     "ridge": "ridge_regression",
+    # Shares ridge's drop list so the two linear fits compare on the same columns.
+    "elastic_net": "ridge_regression",
     "xgboost": "xgboost",
 }
 
@@ -158,10 +151,8 @@ class ModelSpec(BaseModel):
     params : dict
         Keyword arguments passed straight to that constructor.
     optuna : dict
-        Optuna search space over any constructor argument, including the
-        training-target treatment (``clip``, ``market_scale``,
-        ``recency_half_life``). Run by ``train.py`` before cross-validation
-        when the top-level ``optuna.enabled`` is true; the winner replaces
+        Optuna search space over any constructor argument. Run by ``train.py``
+        before cross-validation when the top-level ``optuna.enabled`` is true; the winner replaces
         ``params`` for the rest of the run. See ``src.optuna_search``.
     """
 
@@ -507,7 +498,7 @@ def save_best_params(model: AnchoredModel, output_dir: Path) -> Path:
 
     The same values are pickled inside the model; this copy is for reading and
     for pasting into the config as fixed ``params`` once the search is settled.
-    Written for every model tuned by Optuna or by ridge's inner alpha CV.
+    Written for every model that records ``best_params_`` or an Optuna study.
 
     Parameters
     ----------
@@ -526,10 +517,6 @@ def save_best_params(model: AnchoredModel, output_dir: Path) -> Path:
         "model": model.name,
         "trained_through": f"{through:%Y-%m}" if through is not None else None,
         "saved_at": pd.Timestamp.now().isoformat(timespec="seconds"),
-        "clip": model.clip,
-        "clip_cap_fitted": model.clip_cap_,
-        "market_scale": model.market_scale,
-        "recency_half_life": model.recency_half_life,
         "best_params": model.best_params_,
         "optuna": model.optuna_,
     }
@@ -611,10 +598,6 @@ def tune_with_optuna(
             continue
 
         base = dict(spec.params)
-        # Optuna owns alpha once it searches it; ridge's own RidgeCV grid would
-        # otherwise re-pick alpha inside every fit and override the trial.
-        if spec.kind == "ridge" and "alpha" in spec.optuna:
-            base["alphas"] = None
 
         def build(params: dict[str, Any], spec: ModelSpec = spec) -> Model:
             return spec.model_copy(update={"params": params}).factory(defaults)()

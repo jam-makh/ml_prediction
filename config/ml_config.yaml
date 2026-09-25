@@ -35,13 +35,32 @@ data:
   trim_top_entities: 0.0
   random_state: 42
 split:
-  # Last floor(share x months) months are the holdout; src/month_cut.py is the
-  # one rule, shared by the pipeline and the Spark feature build.
+  # Last floor(share x months) months are the holdout; cut_positions in
+  # src/window.py is the one rule, shared by the pipeline and the Spark build.
   test_share: 0.2
   gap_months: 0
   cv_folds: 5
   cv_test_months: 3
   min_train_months: 6
+# Fixed, meaning-based cuts for the v3 segment tables (feature_eng_v3.py).
+# Nothing is fitted, so the categories mean the same thing on any data; the
+# build logs each category's share so drift stays visible.
+segments:
+  # Smallest category the router will trust; smaller ones are warned about.
+  min_rows: 100
+  sign_regime:
+    # Share of the last 6 months below zero that counts as "always negative".
+    negative_share: 0.9
+    # Deepest debt, in months of turnover, splitting shallow from deep.
+    debt_depth_months: 2.0
+  size:
+    # Mean monthly credited + |debited| in dollars: [low/mid, mid/high].
+    turnover: [5000, 20000]
+  behaviour:
+    # Net-flow spread / turnover: [stable/moderate, moderate/dynamic].
+    flow_volatility: [0.20, 0.50]
+    # Rows with fewer months of history are unassigned.
+    min_months: 3
 features: []
 feature_selection:
   model: xgboost_change
@@ -79,17 +98,25 @@ models:
     n_months: 3
 - name: ridge_change
   kind: ridge
-  # Searched by Optuna when optuna.enabled is true; params above stay fixed.
+  # Empty until Optuna has run: paste best_params from
+  # models/ridge_change_best_params.json, then set optuna.enabled: false.
+  params:
+    alpha: null
   optuna:
     alpha: {low: 0.01, high: 1000000.0, log: true}
-    # Cap on the TRAINING movement only; the holdout keeps every row.
-    # Dollars, or qN = that quantile of the training rows' |change|.
-    clip: [null, 500000, 1000000, 2000000, q0.99, q0.995]
-    # Divide by the month's typical movement (read from balance lags, known at
-    # forecast time) so pre- and post-2024-07 months share one axis.
-    market_scale: [false, true]
-    # Months for a training row's weight to halve; null = equal weights.
-    recency_half_life: [null, 6, 12, 24]
+# Ridge plus an L1 penalty; kept beside ridge so the two compare on one table.
+# Alpha is in dollars on elastic net's scale, not ridge's (see elastic_net.py).
+- name: elastic_net_change
+  kind: elastic_net
+  # Empty until Optuna has run: paste best_params from
+  # models/elastic_net_change_best_params.json, then set optuna.enabled: false.
+  params:
+    alpha: null
+    l1_ratio: null
+  optuna:
+    alpha: {low: 0.01, high: 100000.0, log: true}
+    # 0 is ridge, already in the table; the solver handles it badly.
+    l1_ratio: {low: 0.05, high: 1.0}
 - name: xgboost_change
   kind: xgboost
   params:
@@ -104,9 +131,6 @@ models:
     colsample_bytree: 0.8
     reg_lambda: 5
   optuna:
-    clip: [null, 500000, 1000000, 2000000, q0.99, q0.995]
-    market_scale: [false, true]
-    recency_half_life: [null, 6, 12, 24]
     # huber_slope is set at fit time to the median |training target|.
     objective: [reg:absoluteerror, reg:pseudohubererror, reg:squarederror]
     # Depth stops at 6: depth 10 memorised.

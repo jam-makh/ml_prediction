@@ -100,8 +100,6 @@ class XGBoostModel(AnchoredModel):
         Default 1. Single threaded so two runs of one config produce the same
         numbers: tree building is order-dependent across threads, and a model
         comparison that shifts between runs is one nobody can act on.
-    clip, market_scale, recency_half_life : optional
-        Training-target treatment, see ``AnchoredModel``.
     **params : Any
         Anything else, passed straight to ``XGBRegressor``. ``huber_slope``,
         when omitted under ``reg:pseudohubererror``, is set at fit time to the
@@ -124,18 +122,9 @@ class XGBoostModel(AnchoredModel):
         reg_lambda: float = 1.0,
         random_state: int = 42,
         n_jobs: int = 1,
-        clip: float | str | None = None,
-        market_scale: bool = False,
-        recency_half_life: float | None = None,
         **params: Any,
     ) -> None:
-        super().__init__(
-            name,
-            anchor_column=anchor_column,
-            clip=clip,
-            market_scale=market_scale,
-            recency_half_life=recency_half_life,
-        )
+        super().__init__(name, anchor_column=anchor_column)
         self.random_state = random_state
         self.params: dict[str, Any] = {
             "objective": objective,
@@ -190,9 +179,6 @@ class XGBoostModel(AnchoredModel):
 
         features = dataset.features.loc[usable]
         values = target.to_numpy(dtype="float64")[usable]
-        weights = self._training_weights(dataset)
-        if weights is not None:
-            weights = weights[usable]
 
         if (
             self.params["objective"] == "reg:pseudohubererror"
@@ -201,7 +187,7 @@ class XGBoostModel(AnchoredModel):
             self.params["huber_slope"] = max(float(np.median(np.abs(values))), 1e-9)
 
         self._estimator = self._build()
-        self._estimator.fit(features, values, sample_weight=weights)
+        self._estimator.fit(features, values)
 
     def _predict(self, dataset: Dataset) -> npt.NDArray[np.float64]:
         """Predict the change and turn it back into a balance.
@@ -224,36 +210,7 @@ class XGBoostModel(AnchoredModel):
         )
         return self._restore_level(dataset, predicted)
 
-    def feature_importance(self, importance_type: str = "gain") -> pd.Series | None:
-        """Return the booster's importance per feature, largest first.
 
-        Parameters
-        ----------
-        importance_type : str, optional
-            Any type XGBoost's ``get_score`` accepts: ``gain`` (average loss
-            reduction per split), ``total_gain`` (summed over every split),
-            ``weight`` (number of splits), ``cover`` (average rows reached per
-            split) or ``total_cover``. Default ``gain``.
-
-        Returns
-        -------
-        pandas.Series or None
-            Value per feature name, descending, or None before fitting.
-            Features the booster never split on appear at zero rather than
-            being dropped, so the series always covers every input column --
-            which is what makes it an answer to "which columns carry the model"
-            rather than only a list of the ones that do.
-        """
-        if not self.is_fitted or self._estimator is None:
-            return None
-
-        scores = self._estimator.get_booster().get_score(importance_type=importance_type)
-        values = pd.Series(
-            {name: float(value) for name, value in scores.items()}, dtype="float64"
-        )
-        complete = values.reindex(list(self._feature_columns), fill_value=0.0)
-        complete.name = importance_type
-        return complete.sort_values(ascending=False)
 
     def describe(self) -> str:
         """Return a one-line description for the run log.

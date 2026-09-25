@@ -13,9 +13,6 @@ So every split here cuts along the month axis and nothing else:
 * ``expanding_folds`` walks that same cut backwards through the training
   region, giving several (train, test) pairs where the training window grows
   and always sits entirely before its test window.
-* ``MonthlyExpandingSplit`` is the same logic wearing a scikit-learn
-  cross-validator interface, so it can be handed to ``cross_val_score`` or a
-  search object as ``cv=``.
 
 Everything here is used by the *training* side only -- ``train.py``,
 ``optuna_search.py`` and ``features_selection.py``, all of which live entirely inside
@@ -42,7 +39,7 @@ that fixes it.
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+import math
 from typing import Any
 
 import numpy as np
@@ -51,7 +48,6 @@ import pandas as pd
 from pydantic import BaseModel, ConfigDict, Field
 
 from src.data.data import MONTH_PERIOD, Dataset
-from src.month_cut import cut_positions
 
 
 class Split(BaseModel):
@@ -120,16 +116,6 @@ class Split(BaseModel):
             f"test {self.n_test:,} rows ({_span(self.test_months)})"
         )
 
-    def as_indices(self) -> tuple[npt.NDArray[np.intp], npt.NDArray[np.intp]]:
-        """Return the split as the plain tuple scikit-learn expects.
-
-        Returns
-        -------
-        tuple of numpy.ndarray
-            ``(train_positions, test_positions)``.
-        """
-        return self.train_positions, self.test_positions
-
 
 def _span(months: pd.DatetimeIndex) -> str:
     """Return a compact description of a run of months.
@@ -195,6 +181,50 @@ def positions_in_months(
     """
     mask = times.isin(months).to_numpy(dtype=bool)
     return np.flatnonzero(mask).astype(np.intp)
+
+
+def cut_positions(n_months: int, test_share: float, gap_months: int = 0) -> tuple[int, int]:
+    """Return where training ends and the holdout starts in an ascending list of months.
+
+    The holdout is the last ``floor(test_share * n_months)`` months, and the
+    ``gap_months`` before it belong to neither side.
+
+    Parameters
+    ----------
+    n_months : int
+        Number of distinct months available.
+    test_share : float
+        Share of months held out, strictly between 0 and 1.
+    gap_months : int, optional
+        Months discarded between training and holdout. Default 0.
+
+    Returns
+    -------
+    tuple of (int, int)
+        ``(train_end, test_start)``: training is ``months[:train_end]`` and the
+        holdout is ``months[test_start:]``.
+
+    Raises
+    ------
+    ValueError
+        If ``test_share`` is outside (0, 1), ``gap_months`` is negative, or
+        either side would be empty.
+    """
+    if not 0 < test_share < 1:
+        raise ValueError(f"split.test_share must be between 0 and 1, got {test_share}")
+    if gap_months < 0:
+        raise ValueError(f"split.gap_months cannot be negative, got {gap_months}")
+
+    # Rounded before the floor, so float noise like 28.999999 still floors to 29.
+    test_months = math.floor(round(n_months * test_share, 9))
+    test_start = n_months - test_months
+    train_end = test_start - gap_months
+    if test_months < 1 or train_end < 1:
+        raise ValueError(
+            f"{n_months} months cannot hold a {test_share:.0%} holdout and a "
+            f"{gap_months}-month gap with training months left over"
+        )
+    return train_end, test_start
 
 
 def plan_month_cut(
@@ -421,167 +451,6 @@ def check_no_future_leak(split: Split) -> None:
         raise ValueError(
             f"{split.name} has {len(overlap)} months on both sides of the cut"
         )
-
-
-class MonthlyExpandingSplit:
-    """Expanding-window month folds, as a scikit-learn cross-validator.
-
-    Implements the ``split`` / ``get_n_splits`` pair, so it can be passed
-    directly as ``cv=`` to ``cross_val_score``, ``cross_validate`` or a search
-    object. It exists because the stock ``TimeSeriesSplit`` folds on row
-    position: on a panel where 150 rows share a month, that cuts through the
-    middle of a month and puts it on both sides of the boundary.
-
-    The month of each row is not something the splitter can infer from ``X``,
-    so it is supplied through ``groups`` in the usual scikit-learn way.
-
-    Parameters
-    ----------
-    n_folds : int, optional
-        Number of folds to attempt. Default 4.
-    test_months : int, optional
-        Length of each test window, in months. Default 3.
-    gap_months : int, optional
-        Months discarded between train and test in every fold. Default 0.
-    min_train_months : int, optional
-        Shortest acceptable training window. Default 6.
-
-    Examples
-    --------
-    >>> cv = MonthlyExpandingSplit(n_folds=4, test_months=3)
-    >>> scores = cross_val_score(  # doctest: +SKIP
-    ...     pipeline, X, y, groups=months, cv=cv, scoring="neg_root_mean_squared_error"
-    ... )
-    """
-
-    def __init__(
-        self,
-        n_folds: int = 4,
-        test_months: int = 3,
-        gap_months: int = 0,
-        min_train_months: int = 6,
-    ) -> None:
-        self.n_folds = n_folds
-        self.test_months = test_months
-        self.gap_months = gap_months
-        self.min_train_months = min_train_months
-
-    def _folds(self, groups: Any) -> list[Split]:
-        """Build the folds for one call, from the months in ``groups``.
-
-        Wraps the months in a throwaway ``Dataset`` so that exactly the same
-        code path produces the folds here as produces them for the holdout
-        report. Two implementations of "which months are train" is one more
-        than this project can afford.
-
-        Parameters
-        ----------
-        groups : array-like
-            The month of every row, in row order.
-
-        Returns
-        -------
-        list of Split
-            Chronological folds.
-
-        Raises
-        ------
-        ValueError
-            If ``groups`` is None.
-        """
-        if groups is None:
-            raise ValueError(
-                "MonthlyExpandingSplit needs the month of each row; pass it as "
-                "groups=, for example groups=dataset.times"
-            )
-        months = month_values(pd.Series(groups).reset_index(drop=True))
-        # Only the time column matters to the fold maths, so the frame carries
-        # placeholders for the other three roles.
-        frame = pd.DataFrame(
-            {
-                "_entity": np.zeros(len(months), dtype=np.int64),
-                "_month": months,
-                "_target": np.zeros(len(months), dtype="float64"),
-                "_feature": np.zeros(len(months), dtype="float64"),
-            }
-        )
-        dataset = Dataset(
-            frame=frame,
-            target_column="_target",
-            id_column="_entity",
-            time_column="_month",
-            feature_columns=("_feature",),
-        )
-        return expanding_folds(
-            dataset,
-            n_folds=self.n_folds,
-            test_months=self.test_months,
-            gap_months=self.gap_months,
-            min_train_months=self.min_train_months,
-        )
-
-    def split(
-        self, X: Any, y: Any = None, groups: Any = None
-    ) -> Iterator[tuple[npt.NDArray[np.intp], npt.NDArray[np.intp]]]:
-        """Yield (train, test) row positions for each fold.
-
-        Parameters
-        ----------
-        X : array-like
-            Feature matrix. Used only for its length.
-        y : array-like, optional
-            Target. Unused, accepted for interface compatibility.
-        groups : array-like
-            The month of every row, in row order. Required.
-
-        Yields
-        ------
-        tuple of numpy.ndarray
-            ``(train_positions, test_positions)`` for one fold.
-
-        Raises
-        ------
-        ValueError
-            If ``groups`` is missing or its length does not match ``X``.
-        """
-        folds = self._folds(groups)
-        n_rows = len(X)
-        if n_rows != len(pd.Series(groups)):
-            raise ValueError(
-                f"groups has {len(pd.Series(groups))} entries but X has {n_rows} rows"
-            )
-        for fold in folds:
-            # Checked on the way out: a splitter that silently emits a leaking
-            # fold is the failure this whole module exists to prevent.
-            check_no_future_leak(fold)
-            yield fold.as_indices()
-
-    def get_n_splits(self, X: Any = None, y: Any = None, groups: Any = None) -> int:
-        """Return how many folds this splitter will actually produce.
-
-        The answer depends on the data, since short history yields fewer folds
-        than requested, so ``groups`` is needed to answer honestly.
-
-        Parameters
-        ----------
-        X : array-like, optional
-            Unused, accepted for interface compatibility.
-        y : array-like, optional
-            Unused, accepted for interface compatibility.
-        groups : array-like
-            The month of every row. Required.
-
-        Returns
-        -------
-        int
-            Number of folds.
-
-        Raises
-        ------
-        ValueError
-            If ``groups`` is None.
-        """
-        return len(self._folds(groups))
 
 
 class SplitSettings(BaseModel):
