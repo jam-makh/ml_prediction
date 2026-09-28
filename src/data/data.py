@@ -264,18 +264,15 @@ def resolve_feature_columns(
     Two modes, and which one is in force is a deliberate decision recorded in
     the config.
 
-    **Explicit** -- ``keep_columns`` names the features. This is what a run uses
-    once ``features_selection.py`` has been run and its answer pasted into the
-    ``features`` block: the set is then frozen, visible in a git diff, and
-    identical between two runs over the same data. Selection is an occasional,
-    committed decision; training reads the decision rather than retaking it.
+    **Explicit** -- ``keep_columns`` names the features, from the config's
+    ``features`` block. The set is then frozen, visible in a git diff, and
+    identical between two runs over the same data.
 
     **By exclusion** -- no ``keep_columns``, so a feature is any column that is
     not the target, not the entity id, not the time column and not explicitly
     dropped. This is the mode to be in while the feature table is still being
     iterated on, since a new column reaches the model without a matching edit
-    here. It is also the mode ``features_selection.py`` itself runs in: it has
-    to see every candidate in order to rank them.
+    here. RFECV in ``train.py`` narrows the booster's set from this one.
 
     Note what neither mode does: remove a column from the frame. A column that
     is not a feature is still there to be read by name. That is what lets the
@@ -335,8 +332,7 @@ def resolve_feature_columns(
             raise KeyError(
                 f"The features block names {len(missing)} column(s) that are "
                 f"not in the data: {missing}. Either the feature table changed "
-                f"or the block is stale -- re-run "
-                f"`python -m src.features_selection`."
+                f"or the block is stale."
             )
         return wanted
 
@@ -434,6 +430,32 @@ def load_feature_frame(
     """
     settings = config if config is not None else load_config()
     return load_dataframe(resolve_query(settings["data"]), engine=engine)
+
+
+def load_segment_labels(
+    tables: dict[str, str], engine: Engine | None = None
+) -> dict[str, dict[int, str]]:
+    """Read each segmentation's lookup table into an id-to-category map.
+
+    Parameters
+    ----------
+    tables : dict of str to str
+        Segment id column to the lookup table holding its ``id`` and ``category``.
+    engine : sqlalchemy.engine.Engine, optional
+        Engine to read through. A new one is built when omitted.
+
+    Returns
+    -------
+    dict of str to dict of int to str
+        Segment id column to ``{id: category}``.
+    """
+    return {
+        column: dict(
+            load_dataframe(f'SELECT id, category FROM "{table}"', engine=engine)
+            .itertuples(index=False)
+        )
+        for column, table in tables.items()
+    }
 
 
 def resolve_table(data_settings: dict[str, Any], table: str | None = None) -> str:

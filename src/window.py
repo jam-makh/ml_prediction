@@ -15,7 +15,7 @@ So every split here cuts along the month axis and nothing else:
   and always sits entirely before its test window.
 
 Everything here is used by the *training* side only -- ``train.py``,
-``optuna_search.py`` and ``features_selection.py``, all of which live entirely inside
+``optuna_search.py`` and ``feature_selection.py``, all of which live entirely inside
 the training region. ``test.py`` does not import this module. It asks the saved
 model which months it was fitted on and scores everything strictly after that,
 so the boundary between train and test is a fact recorded by the fit rather

@@ -58,7 +58,7 @@ class AnchoredModel(Model):
         # dict.fromkeys drops duplicates, since the anchor is usually also a feature.
         return tuple(dict.fromkeys([*self._feature_columns, self.anchor_column]))
 
-    def _training_target(self, dataset: Dataset) -> pd.Series:
+    def training_target(self, dataset: Dataset) -> pd.Series:
         """Return the change the estimator is fitted against.
 
         Parameters
@@ -107,7 +107,7 @@ class AnchoredModel(Model):
         Parameters
         ----------
         target : pandas.Series
-            Output of ``_training_target``.
+            Output of ``training_target``.
 
         Returns
         -------

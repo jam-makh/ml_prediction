@@ -127,6 +127,10 @@ class EvaluationSettings(BaseModel):
     tier_quantiles : tuple of float
         The two cut points for the account-size tiers, as quantiles of each
         entity's median absolute balance. See ``metrics.assign_tiers``.
+    segment_columns : dict of str to str
+        Segment id column to its lookup table, for the per-segment CV check.
+    segment_min_folds_won : int
+        CV folds a model must win inside a segment to pass the check.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -136,6 +140,8 @@ class EvaluationSettings(BaseModel):
     mape_floor: float = 1_000.0
     headline_metric: str = "wape"
     tier_quantiles: tuple[float, float] = DEFAULT_TIER_QUANTILES
+    segment_columns: dict[str, str] = Field(default_factory=dict)
+    segment_min_folds_won: int = 4
 
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> EvaluationSettings:
@@ -659,3 +665,36 @@ def worst_users_table(report: EvaluationReport) -> pd.DataFrame:
         Indexed by user id.
     """
     return pd.DataFrame(report.worst_users).set_index("user")
+
+
+def predictions_table(
+    models: dict[str, Model], dataset: Dataset, anchor_column: str
+) -> pd.DataFrame:
+    """Return the actual balance next to every model's prediction, one row per user-month.
+
+    Parameters
+    ----------
+    models : dict of str to Model
+        Fitted models, keyed by name; each becomes one column.
+    dataset : Dataset
+        Rows to predict.
+    anchor_column : str
+        Column holding last month's balance, written as ``last_month``.
+
+    Returns
+    -------
+    pandas.DataFrame
+        Id, month, ``actual``, ``last_month``, then one prediction column per model.
+    """
+    table = pd.DataFrame(
+        {
+            dataset.id_column: dataset.entities.to_numpy(),
+            dataset.time_column: dataset.times.to_numpy(),
+            "actual": dataset.target.to_numpy(dtype="float64"),
+            "last_month": anchor_values(dataset, anchor_column).to_numpy(dtype="float64"),
+        }
+    )
+    # One column per model, in the order given, so the file reads like the results table.
+    for name, model in models.items():
+        table[name] = model.predict(dataset)
+    return table

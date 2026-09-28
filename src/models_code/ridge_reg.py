@@ -156,7 +156,7 @@ class RidgeRegression(AnchoredModel):
         ValueError
             If no rows have a usable target.
         """
-        target = self._training_target(dataset)
+        target = self.training_target(dataset)
         usable = self._usable_rows(target)
 
         features = dataset.features.loc[usable]
@@ -219,6 +219,30 @@ class RidgeRegression(AnchoredModel):
         )
         series.name = "abs_coefficient"
         return series.sort_values(ascending=False)
+
+    def shap_values(self, dataset: Dataset) -> pd.DataFrame | None:
+        """Return coefficient times standardised value per row and feature: exact SHAP for a linear model.
+
+        Parameters
+        ----------
+        dataset : Dataset
+            Rows to explain.
+
+        Returns
+        -------
+        pandas.DataFrame or None
+            One row per dataset row, one column per feature, in dollars of
+            monthly change; None before fitting or if the imputer dropped a column.
+        """
+        if not self.is_fitted or self._pipeline is None:
+            return None
+        columns = list(self._feature_columns)
+        coefficients = np.asarray(self._pipeline.named_steps["regressor"].coef_, dtype="float64")
+        if coefficients.shape[0] != len(columns):
+            return None
+        # Imputed and scaled as at fit time; scaled features average zero, so there is no baseline term.
+        scaled = self._pipeline[:-1].transform(dataset.frame.loc[:, columns])
+        return pd.DataFrame(scaled * coefficients, columns=columns, index=dataset.frame.index)
 
     def describe(self) -> str:
         """Return a one-line description for the run log.

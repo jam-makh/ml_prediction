@@ -376,7 +376,7 @@ def score(
     rmse = float(np.sqrt(np.mean(np.square(errors))))
     mae = float(np.mean(np.abs(errors)))
     median_ae = float(np.median(np.abs(errors)))
-    wape = _wape(truth, prediction)
+    wape_level = wape(truth, prediction)
     smape = _smape(truth, prediction)
     mape, coverage = _mape(truth, prediction, mape_floor)
 
@@ -396,7 +396,7 @@ def score(
         movement_errors = movement - predicted_movement
         mae_change = float(np.mean(np.abs(movement_errors)))
         rmse_change = float(np.sqrt(np.mean(np.square(movement_errors))))
-        wape_change = _wape(movement, predicted_movement)
+        wape_change = wape(movement, predicted_movement)
 
     skill: float | None = None
     if reference_pred is not None:
@@ -413,7 +413,7 @@ def score(
         rmse=rmse,
         mae=mae,
         median_ae=median_ae,
-        wape=wape,
+        wape=wape_level,
         smape=smape,
         r2_level=r_squared(truth, prediction),
         r2_change=r2_change,
@@ -427,7 +427,7 @@ def score(
     )
 
 
-def _wape(
+def wape(
     truth: FloatArray, prediction: FloatArray
 ) -> float:
     """Return the weighted absolute percentage error, as a percentage.

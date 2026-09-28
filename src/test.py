@@ -50,6 +50,7 @@ from src.evaluate import (
     EvaluationReport,
     EvaluationSettings,
     evaluate_models,
+    predictions_table,
     report_table,
     results_table,
     tier_table,
@@ -272,6 +273,11 @@ def run(config: dict[str, Any] | None = None) -> dict[str, EvaluationReport]:
         mape_floor=evaluation.mape_floor,
         tiers=tiers,
     )
+
+    # Actual against every model's prediction on the holdout, for inspection outside the log.
+    predictions_path = resolve_output_dir(settings) / "predictions_test.csv"
+    predictions_table(models, test, evaluation.anchor_column).to_csv(predictions_path, index=False)
+    logger.info(f"Predictions: {predictions_path}")
 
     fmt = lambda value: f"{value:,.3f}"  # noqa: E731
 

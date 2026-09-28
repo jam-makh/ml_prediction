@@ -28,11 +28,10 @@ cut-off recomputed from config in two places. Change ``split.test_share``
 between a train run and a test run and nothing silently moves: the models still
 say where they stopped.
 
-**Feature selection does not happen here.** The feature set comes from the
-``features`` block of the config, which is where ``features_selection.py``'s
-answer was pasted after someone read it. Re-selecting on every training run
-would make two runs over the same data disagree, and would quietly give the
-booster extra attempts to fit the folds that the baseline never got.
+**Feature selection happens here, for the booster only.** Optuna tunes it on
+its full drop-list set, then RFECV picks the survivors with those params, and
+the CV table and the final fit both use the survivors with the same params.
+The other models keep their drop-list set.
 
 Before any of that, the run checks whether a month's targets simply repeat the
 previous month's balances, which is what an unfinished month in the source
@@ -66,6 +65,7 @@ from src.config.config import load_config, resolve_output_dir
 from src.data.data import (
     Dataset,
     build_dataset,
+    load_segment_labels,
     resolve_drop_columns,
 )
 from src.evaluate import (
@@ -74,7 +74,8 @@ from src.evaluate import (
     EvaluationSettings,
     results_table,
 )
-from src.metrics import Scores, anchor_values, score
+from src.feature_selection import rfecv_select, save_selection
+from src.metrics import Scores, anchor_values, score, score_by_group
 from src.models_code.anchored_model import AnchoredModel
 from src.models_code.base_class import Model
 from src.models_code.baseline import LagAverageBaseline
@@ -154,6 +155,9 @@ class ModelSpec(BaseModel):
         Optuna search space over any constructor argument. Run by ``train.py``
         before cross-validation when the top-level ``optuna.enabled`` is true; the winner replaces
         ``params`` for the rest of the run. See ``src.optuna_search``.
+    features : tuple of str or None
+        Columns chosen by feature selection. When set, they replace the family
+        drop list in ``dataset_for``; None keeps the drop list.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -162,6 +166,7 @@ class ModelSpec(BaseModel):
     kind: str
     params: dict[str, Any] = Field(default_factory=dict)
     optuna: dict[str, Any] = Field(default_factory=dict)
+    features: tuple[str, ...] | None = None
 
     def factory(self, defaults: dict[str, Any] | None = None) -> ModelFactory:
         """Return a zero-argument callable that builds this model.
@@ -297,13 +302,17 @@ def dataset_for(
     Returns
     -------
     Dataset
-        Same rows, narrowed ``feature_columns``.
+        Same rows, narrowed ``feature_columns``: the spec's selected
+        ``features`` when set, otherwise the family drop list applied.
 
     Raises
     ------
     ValueError
         If the drop list removes every feature.
     """
+    # Selected features were chosen from the drop-list set already, so they win outright.
+    if spec.features:
+        return dataset.model_copy(update={"feature_columns": spec.features})
     if not data_settings:
         return dataset
     dropped = set(resolve_drop_columns(data_settings, FAMILY_BY_KIND.get(spec.kind)))
@@ -402,6 +411,113 @@ def fit_fold(
     return models, predictions
 
 
+def segment_fold_scores(
+    predictions: dict[str, npt.NDArray[np.float64]],
+    validate_rows: Dataset,
+    segment_columns: tuple[str, ...],
+) -> pd.DataFrame:
+    """Score every model's WAPE inside each segment of each segmentation, on one fold.
+
+    Parameters
+    ----------
+    predictions : dict of str to numpy.ndarray
+        Model name to its predictions over ``validate_rows``.
+    validate_rows : Dataset
+        The fold's validation rows, still carrying the segment id columns.
+    segment_columns : tuple of str
+        Segment id columns to break the scores down by.
+
+    Returns
+    -------
+    pandas.DataFrame
+        One row per (model, segmentation, segment) with ``n_rows`` and ``wape``.
+        Empty when no segment columns are given.
+    """
+    tables: list[pd.DataFrame] = []
+    for column in segment_columns:
+        for model_name, prediction in predictions.items():
+            table = score_by_group(
+                validate_rows.target, prediction, validate_rows.frame[column], label="segment"
+            )
+            tables.append(
+                table[["n_rows", "wape"]]
+                .reset_index()
+                .assign(model=model_name, segmentation=column)
+            )
+    return pd.concat(tables, ignore_index=True) if tables else pd.DataFrame()
+
+
+def summarise_segments(
+    segment_scores: pd.DataFrame,
+    reference_model: str,
+    labels: dict[str, dict[int, str]],
+    min_rows: int,
+    min_folds_won: int,
+) -> pd.DataFrame:
+    """Compare each model with the reference inside every segment, over the CV folds.
+
+    Parameters
+    ----------
+    segment_scores : pandas.DataFrame
+        The per-fold segment table from ``cross_validate``.
+    reference_model : str
+        The model every other one is compared with, normally persistence.
+    labels : dict of str to dict of int to str
+        Segment id column to ``{id: category}``, from ``load_segment_labels``.
+    min_rows : int
+        Mean validation rows per fold a segment needs to pass.
+    min_folds_won : int
+        Folds a model must beat the reference in to pass.
+
+    Returns
+    -------
+    pandas.DataFrame
+        One row per (segmentation, segment, model other than the reference) with
+        fold-mean WAPEs, ``gain`` over the reference, ``folds_won`` and ``passes``.
+    """
+    if segment_scores.empty:
+        return segment_scores
+
+    keys = ["segmentation", "segment", "fold"]
+    reference = segment_scores[segment_scores["model"] == reference_model].set_index(keys)["wape"]
+    others = segment_scores[segment_scores["model"] != reference_model].join(
+        reference.rename("reference_wape"), on=keys
+    )
+    # A fold is won when the model's WAPE in that segment is below the reference's.
+    others["won"] = others["wape"] < others["reference_wape"]
+
+    table = (
+        others.groupby(["segmentation", "segment", "model"])
+        .agg(
+            rows_per_fold=("n_rows", "mean"),
+            reference_wape=("reference_wape", "mean"),
+            wape=("wape", "mean"),
+            folds_won=("won", "sum"),
+            folds=("fold", "count"),
+        )
+        .reset_index()
+    )
+    table["gain"] = table["reference_wape"] - table["wape"]
+    # The three rules fixed before looking: better on average, in most folds, on enough rows.
+    table["passes"] = (
+        (table["gain"] > 0)
+        & (table["folds_won"] >= min_folds_won)
+        & (table["rows_per_fold"] >= min_rows)
+    )
+    # Ids become readable names from each segmentation's lookup table.
+    table.insert(
+        2,
+        "category",
+        [
+            labels.get(column, {}).get(segment, str(segment))
+            for column, segment in zip(table["segmentation"], table["segment"])
+        ],
+    )
+    return table.sort_values(
+        ["segmentation", "segment", "gain"], ascending=[True, True, False]
+    ).reset_index(drop=True)
+
+
 def cross_validate(
     specs: list[ModelSpec],
     train: Dataset,
@@ -409,7 +525,8 @@ def cross_validate(
     settings: EvaluationSettings,
     defaults: dict[str, Any] | None = None,
     data_settings: dict[str, Any] | None = None,
-) -> pd.DataFrame:
+    segment_columns: tuple[str, ...] = (),
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Score every model on every expanding-window fold.
 
     Parameters
@@ -430,19 +547,27 @@ def cross_validate(
         carried across them.
     data_settings : dict, optional
         The config's ``data`` block, for each family's drop list.
+    segment_columns : tuple of str, optional
+        Segment id columns to also score each fold by. Empty skips the breakdown.
 
     Returns
     -------
-    pandas.DataFrame
+    tuple of (pandas.DataFrame, pandas.DataFrame)
         One row per (fold, model), with the fields behind both results tables
-        (``AMOUNT_COLUMNS`` and ``MOVEMENT_COLUMNS``). Empty when no folds
-        were produced.
+        (``AMOUNT_COLUMNS`` and ``MOVEMENT_COLUMNS``), and the per-segment table
+        from ``segment_fold_scores`` with a ``fold`` column. Both are empty when
+        no folds were produced.
     """
     rows: list[dict[str, Any]] = []
+    segment_tables: list[pd.DataFrame] = []
     for fold in folds:
         _, predictions = fit_fold(specs, train, fold, defaults, data_settings)
-        scored = score_predictions(
-            predictions, train.take(fold.test_positions), settings
+        validate_rows = train.take(fold.test_positions)
+        scored = score_predictions(predictions, validate_rows, settings)
+        segment_tables.append(
+            segment_fold_scores(predictions, validate_rows, segment_columns).assign(
+                fold=fold.name
+            )
         )
         for model_name, scores in scored.items():
             rows.append(
@@ -457,7 +582,64 @@ def cross_validate(
                     },
                 }
             )
-    return pd.DataFrame(rows)
+    segment_scores = (
+        pd.concat(segment_tables, ignore_index=True) if segment_tables else pd.DataFrame()
+    )
+    return pd.DataFrame(rows), segment_scores
+
+
+def report_segments(
+    segment_scores: pd.DataFrame,
+    evaluation: EvaluationSettings,
+    min_rows: int,
+    output_dir: Path,
+) -> pd.DataFrame:
+    """Log the per-segment CV check against the reference and save it as ``segment_cv.csv``.
+
+    Parameters
+    ----------
+    segment_scores : pandas.DataFrame
+        The per-fold segment table from ``cross_validate``.
+    evaluation : EvaluationSettings
+        Reference model, lookup tables and the folds-won rule.
+    min_rows : int
+        Mean validation rows per fold a segment needs to pass.
+    output_dir : pathlib.Path
+        Where the CSV is written.
+
+    Returns
+    -------
+    pandas.DataFrame
+        The table from ``summarise_segments``.
+    """
+    labels = load_segment_labels(evaluation.segment_columns)
+    table = summarise_segments(
+        segment_scores,
+        evaluation.reference_model,
+        labels,
+        min_rows,
+        evaluation.segment_min_folds_won,
+    )
+    table.to_csv(output_dir / "segment_cv.csv", index=False)
+
+    logger.info(
+        f"\n--- Segment check: WAPE per segment against {evaluation.reference_model} "
+        f"(mean over folds; gain > 0 means the model is better)"
+    )
+    shown = table.drop(columns=["segment", "folds"])
+    logger.info(shown.to_string(index=False, float_format=lambda value: f"{value:,.2f}"))
+
+    passed = table[table["passes"]]
+    logger.info(
+        f"\n  Passing (gain > 0, won >= {evaluation.segment_min_folds_won} folds, "
+        f">= {min_rows} rows per fold): {len(passed)} of {len(table)}"
+    )
+    for row in passed.itertuples(index=False):
+        logger.info(
+            f"    {row.segmentation} = {row.category}: {row.model} "
+            f"gain {row.gain:+.2f}, won {row.folds_won}/{row.folds}"
+        )
+    return table
 
 
 def summarise_folds(
@@ -637,6 +819,76 @@ def tune_with_optuna(
     return tuned, records
 
 
+def select_features(
+    specs: list[ModelSpec],
+    train: Dataset,
+    folds: list[Split],
+    defaults: dict[str, Any],
+    settings: dict[str, Any],
+    output_dir: Path,
+) -> list[ModelSpec]:
+    """Run RFECV for the model named in ``feature_selection.model`` and keep its survivors.
+
+    Parameters
+    ----------
+    specs : list of ModelSpec
+        Every configured model, with tuned parameters.
+    train : Dataset
+        The training region. The holdout is not in it.
+    folds : list of Split
+        The same expanding folds Optuna and cross-validation use.
+    defaults : dict
+        Run-wide constructor values.
+    settings : dict
+        Parsed config.
+    output_dir : pathlib.Path
+        Where ``<model>_rfecv.json`` is written.
+
+    Returns
+    -------
+    list of ModelSpec
+        The specs, with the selected model's ``features`` set to the survivors.
+
+    Raises
+    ------
+    ValueError
+        If the named model is not configured, or there are no folds.
+    TypeError
+        If the named model is not a booster.
+    """
+    block = settings.get("feature_selection") or {}
+    rfecv = block.get("rfecv") or {}
+    if not rfecv.get("enabled", False):
+        return specs
+    if not folds:
+        raise ValueError("RFECV needs cross-validation folds; none were produced")
+
+    name = str(block.get("model"))
+    spec = next((candidate for candidate in specs if candidate.name == name), None)
+    if spec is None:
+        raise ValueError(f"feature_selection.model {name!r} is not in the models block")
+    model = spec.factory(defaults)()
+    if not isinstance(model, XGBoostModel):
+        raise TypeError(f"RFECV is wired for the booster only; {name!r} is {spec.kind!r}")
+
+    logger.info(f"\n--- RFECV on {name} ({len(folds)} folds, WAPE on the change target)")
+    result = rfecv_select(
+        model,
+        dataset_for(spec, train, settings.get("data") or {}),
+        folds,
+        step=int(rfecv.get("step", 1)),
+        min_features=int(rfecv.get("min_features", 1)),
+    )
+    for line in result.report_lines():
+        logger.info(line)
+    logger.info(f"  Saved {save_selection(result, output_dir).name}")
+
+    return [
+        candidate.model_copy(update={"features": result.selected}) if candidate.name == name else candidate
+        for candidate in specs
+    ]
+
+
 def run(config: dict[str, Any] | None = None) -> dict[str, Model]:
     """Fit every configured model on the training region and save it.
 
@@ -677,8 +929,7 @@ def run(config: dict[str, Any] | None = None) -> dict[str, Model]:
     else:
         logger.info(
             f"Features  : {len(dataset.feature_columns)} columns, derived by "
-            f"exclusion (no `features` block; run src.features_selection to "
-            f"freeze a set)"
+            f"exclusion (no `features` block)"
         )
 
     # The holdout is cut here and then discarded. `train` is the only dataset
@@ -705,13 +956,19 @@ def run(config: dict[str, Any] | None = None) -> dict[str, Model]:
     specs, studies = tune_with_optuna(
         specs, train, folds, evaluation, defaults, settings, output_dir
     )
+    # After Optuna so the booster is tuned; before CV so the CV table scores the kept set.
+    specs = select_features(specs, train, folds, defaults, settings, output_dir)
 
     logger.info(
         f"\n--- Cross-validation ({len(folds)} expanding folds inside the "
         f"training region)"
     )
-    fold_scores = cross_validate(
-        specs, train, folds, evaluation, defaults, data_block
+    # Only the segment columns this table has, so a v1 run skips the check.
+    segment_columns = tuple(
+        column for column in evaluation.segment_columns if column in train.frame.columns
+    )
+    fold_scores, segment_scores = cross_validate(
+        specs, train, folds, evaluation, defaults, data_block, segment_columns
     )
     if fold_scores.empty:
         logger.info(
@@ -733,6 +990,13 @@ def run(config: dict[str, Any] | None = None) -> dict[str, Model]:
             "\n  These are validation scores from inside the training region, "
             "for choosing between models.\n  The headline comparison is "
             "`python -m src.test`, on months no model here has seen."
+        )
+    if not segment_scores.empty:
+        report_segments(
+            segment_scores,
+            evaluation,
+            int((settings.get("segments") or {}).get("min_rows", 0)),
+            output_dir,
         )
 
     # The final fit: every model, on the whole training region, once.

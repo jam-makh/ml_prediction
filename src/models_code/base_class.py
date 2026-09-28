@@ -373,6 +373,22 @@ class Model(ABC):
         """
         return None
 
+    def shap_values(self, dataset: Dataset) -> pd.DataFrame | None:
+        """Return each feature's contribution to every prediction, when the model family has one.
+
+        Parameters
+        ----------
+        dataset : Dataset
+            Rows to explain.
+
+        Returns
+        -------
+        pandas.DataFrame or None
+            One row per dataset row, one column per feature, in dollars of the
+            change the model learns; None by default, as the baselines have no features.
+        """
+        return None
+
     def describe(self) -> str:
         """Return a one-line description for the run log.
 

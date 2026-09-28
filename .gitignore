@@ -24,6 +24,8 @@ claude.md
 results/
 smoke_models_v1/
 smoke_models_v2/
+models/
+models_beforelast/
 models_v1/
 models_v2/
 results/

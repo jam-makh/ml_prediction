@@ -13,7 +13,7 @@ most useful diagnostic there is::
 
     model               train_mae    test_mae    gap
     xgboost_scaled          3,112      16,455    5.3x   <- memorising
-    ridge_change           18,520      19,045    1.0x   <- honest, maybe underfit
+    ridge                  18,520      19,045    1.0x   <- honest, maybe underfit
     three_month_average    17,890      18,090    1.0x   <- cannot overfit
 
 A booster that scores 30k on the rows it was fitted on and 160k on rows it has
@@ -40,40 +40,58 @@ from typing import Any
 import pandas as pd
 from loguru import logger
 
-from src.config.config import load_config
-from src.data.data import build_dataset
-from src.evaluate import EvaluationReport, EvaluationSettings
-from src.importance import collect_importance, save_importance, top_features
+from src.config.config import load_config, resolve_output_dir
+from src.data.data import Dataset, build_dataset
+from src.evaluate import EvaluationReport, EvaluationSettings, predictions_table
+from src.feature_selection import (
+    SelectionResult,
+    coefficient_report_lines,
+    save_shap,
+    shap_importance,
+)
 from src.log import console_level, setup_logging
 from src.metrics import Scores, anchor_values, score
 from src.models_code.anchored_model import AnchoredModel
 from src.models_code.base_class import Model
-from src.models_code.xgboost_model import XGBoostModel
+from src.models_code.ridge_reg import RidgeRegression
 from src.test import run as run_test
 from src.test import split_on_boundary, training_boundary
 from src.train import run as run_train
 
 
-def in_sample_scores(
-    models: dict[str, Model], config: dict[str, Any]
-) -> dict[str, Scores]:
-    """Score every model on the rows it was fitted on.
-
-    Deliberately in-sample. These numbers are not a measure of how well a model
-    works -- they are a measure of how hard it fitted, which is only meaningful
-    next to the holdout column.
-
-    The training region is derived the same way ``test.py`` derives the test
-    region: from the months each model records, not from the config. So the
-    rows scored here are exactly the rows the models were handed, even if the
-    config has been edited since.
+def training_rows(models: dict[str, Model], config: dict[str, Any]) -> Dataset:
+    """Rebuild the rows the models were fitted on, from the months they record.
 
     Parameters
     ----------
     models : dict of str to Model
         Fitted models, keyed by name.
     config : dict
-        Parsed config, for the anchor column and the data to rebuild.
+        Parsed config, for the data to rebuild.
+
+    Returns
+    -------
+    Dataset
+        Every row at or before the models' last training month.
+    """
+    # Same boundary test.py uses, so these are exactly the rows the models were handed.
+    seen, _ = split_on_boundary(build_dataset(config), training_boundary(models))
+    return seen
+
+
+def in_sample_scores(
+    models: dict[str, Model], seen: Dataset, config: dict[str, Any]
+) -> dict[str, Scores]:
+    """Score every model on the rows it was fitted on; a measure of fit, not of quality.
+
+    Parameters
+    ----------
+    models : dict of str to Model
+        Fitted models, keyed by name.
+    seen : Dataset
+        The training rows, from ``training_rows``.
+    config : dict
+        Parsed config, for the anchor column and MAPE floor.
 
     Returns
     -------
@@ -81,9 +99,6 @@ def in_sample_scores(
         In-sample scores, keyed by model name.
     """
     evaluation = EvaluationSettings.from_config(config)
-    dataset = build_dataset(config)
-    seen, _ = split_on_boundary(dataset, training_boundary(models))
-
     truth = seen.target
     anchor = anchor_values(seen, evaluation.anchor_column)
 
@@ -195,9 +210,15 @@ def run_once(config: dict[str, Any] | None = None, quiet: bool = False) -> pd.Da
         logger.info("Scoring ...")
     with context():
         reports = run_test(settings)
-        train_scores = in_sample_scores(models, settings)
+        seen = training_rows(models, settings)
+        train_scores = in_sample_scores(models, seen, settings)
 
     evaluation = EvaluationSettings.from_config(settings)
+
+    # In-sample counterpart of predictions_test.csv, written next to it.
+    predictions_path = resolve_output_dir(settings) / "predictions_train.csv"
+    predictions_table(models, seen, evaluation.anchor_column).to_csv(predictions_path, index=False)
+    logger.info(f"\n  Predictions: {predictions_path} and predictions_test.csv")
     table = combined_table(train_scores, reports, evaluation.reference_model)
 
     logger.info("\n" + "=" * 78)
@@ -216,24 +237,19 @@ def run_once(config: dict[str, Any] | None = None, quiet: bool = False) -> pd.Da
         "\n           earned its complexity; around zero means it did not."
         "\n  skill_mae  the same on MAE: 1 - test_mae / reference test_mae."
     )
-    report_tuning_and_importance(models, settings)
+    report_tuning(models)
+    report_selection(models, settings)
+    report_shap(models, seen, settings)
     return table
 
 
-def report_tuning_and_importance(models: dict[str, Model], config: dict[str, Any]) -> None:
-    """Print what Optuna chose and which features carry the booster.
-
-    Both are in the log file already, from ``train.py``; they are repeated here
-    because the pipeline runs training quietly, and these are the two things a
-    run is read for after the table. The importance table and figure are also
-    written next to the models, so ``src.importance`` need not be run after.
+def report_tuning(models: dict[str, Model]) -> None:
+    """Print what Optuna chose, since the pipeline runs training quietly.
 
     Parameters
     ----------
     models : dict of str to Model
         The fitted models from this run.
-    config : dict
-        Parsed config, for the output directory.
 
     Returns
     -------
@@ -257,20 +273,88 @@ def report_tuning_and_importance(models: dict[str, Model], config: dict[str, Any
             for key, value in (record.get("best_params") or {}).items():
                 logger.info(f"    {key:<22} {value}")
 
-    table = collect_importance(
-        {name: model for name, model in models.items() if isinstance(model, AnchoredModel)}
-    )
-    boosters = [name for name, model in models.items() if isinstance(model, XGBoostModel)]
-    for name in boosters:
-        top = top_features(table, name, "total_gain")
-        logger.info("\n" + "=" * 78)
-        logger.info(f"  {name.upper()}: TOP FEATURES  (share of total gain)")
-        logger.info("=" * 78)
-        for feature, share in top.items():
-            logger.info(f"  {feature:<45} {share:>6.1f}%")
 
-    csv_path, png_path = save_importance(table, config)
-    logger.info(f"\n  Saved {csv_path.name} and {png_path.name} to {csv_path.parent}")
+def banner(title: str) -> None:
+    """Print a section heading in the style of the rest of the report.
+
+    Parameters
+    ----------
+    title : str
+        Heading text.
+
+    Returns
+    -------
+    None
+    """
+    logger.info("\n" + "=" * 78)
+    logger.info(f"  {title}")
+    logger.info("=" * 78)
+
+
+def report_selection(models: dict[str, Model], config: dict[str, Any]) -> None:
+    """Print what RFECV kept and dropped, and what the linear models zeroed or barely use.
+
+    Parameters
+    ----------
+    models : dict of str to Model
+        The fitted models from this run.
+    config : dict
+        Parsed config, for the selection settings and output directory.
+
+    Returns
+    -------
+    None
+    """
+    block = config.get("feature_selection") or {}
+    rfecv_path = resolve_output_dir(config) / f"{block.get('model')}_rfecv.json"
+    # Only when this run's training ran RFECV, so a file left from an older run is not reported.
+    if (block.get("rfecv") or {}).get("enabled", False) and rfecv_path.exists():
+        result = SelectionResult.model_validate_json(rfecv_path.read_text(encoding="utf-8"))
+        banner(f"RFECV: {result.model.upper()}  (also in {rfecv_path.name})")
+        for line in result.report_lines():
+            logger.info(line)
+
+    weakest_n = int((block.get("linear") or {}).get("weakest_n", 10))
+    for name, model in models.items():
+        if isinstance(model, RidgeRegression):
+            banner(f"{name.upper()}: COEFFICIENTS")
+            for line in coefficient_report_lines(model, weakest_n):
+                logger.info(line)
+
+
+def report_shap(models: dict[str, Model], seen: Dataset, config: dict[str, Any]) -> None:
+    """Rank each model's features by mean |SHAP| on the training rows, and save csv and chart.
+
+    Parameters
+    ----------
+    models : dict of str to Model
+        The fitted models from this run.
+    seen : Dataset
+        The training rows, from ``training_rows``.
+    config : dict
+        Parsed config, for the SHAP settings and output directory.
+
+    Returns
+    -------
+    None
+    """
+    block = (config.get("feature_selection") or {}).get("shap") or {}
+    if not block.get("enabled", False):
+        return
+    top_n = int(block.get("top_n", 15))
+    output_dir = resolve_output_dir(config)
+
+    for name, model in models.items():
+        table = shap_importance(model, seen)
+        # Baselines have no features to explain.
+        if table is None:
+            continue
+        csv_path, png_path = save_shap(table, name, output_dir, top_n)
+        banner(f"{name.upper()}: TOP {min(top_n, len(table))} FEATURES BY MEAN |SHAP|  (training rows)")
+        logger.info(f"  {'feature':<45} {'mean |SHAP|':>12} {'mean SHAP':>12}")
+        for feature, row in table.head(top_n).iterrows():
+            logger.info(f"  {feature!s:<45} {row['mean_abs_shap']:>12,.0f} {row['mean_shap']:>+12,.0f}")
+        logger.info(f"  Dollars of monthly change. Saved {csv_path.name} and {png_path.name}")
 
 
 def run(config: dict[str, Any] | None = None, quiet: bool = True) -> pd.DataFrame:

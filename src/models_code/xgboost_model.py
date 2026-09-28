@@ -36,7 +36,7 @@ from typing import Any
 import numpy as np
 import numpy.typing as npt
 import pandas as pd
-from xgboost import XGBRegressor
+from xgboost import DMatrix, XGBRegressor
 
 from src.data.data import Dataset
 from src.models_code.anchored_model import AnchoredModel
@@ -157,6 +157,27 @@ class XGBoostModel(AnchoredModel):
         """
         return XGBRegressor(**{**self.params, **overrides})
 
+    def make_estimator(self, values: npt.NDArray[np.float64]) -> XGBRegressor:
+        """Return an unfitted regressor ready for these training targets.
+
+        Parameters
+        ----------
+        values : numpy.ndarray of float
+            The change targets the regressor will be fitted on.
+
+        Returns
+        -------
+        xgboost.XGBRegressor
+            Unfitted, with ``huber_slope`` set when the objective needs it.
+        """
+        # Pseudo-Huber needs a slope on the target's scale; the median change is a robust one.
+        if (
+            self.params["objective"] == "reg:pseudohubererror"
+            and "huber_slope" not in self.params
+        ):
+            self.params["huber_slope"] = max(float(np.median(np.abs(values))), 1e-9)
+        return self._build()
+
     def _fit(self, dataset: Dataset) -> None:
         """Fit the booster on every usable training row.
 
@@ -174,19 +195,13 @@ class XGBoostModel(AnchoredModel):
         ValueError
             If no rows have a usable target.
         """
-        target = self._training_target(dataset)
+        target = self.training_target(dataset)
         usable = self._usable_rows(target)
 
         features = dataset.features.loc[usable]
         values = target.to_numpy(dtype="float64")[usable]
 
-        if (
-            self.params["objective"] == "reg:pseudohubererror"
-            and "huber_slope" not in self.params
-        ):
-            self.params["huber_slope"] = max(float(np.median(np.abs(values))), 1e-9)
-
-        self._estimator = self._build()
+        self._estimator = self.make_estimator(values)
         self._estimator.fit(features, values)
 
     def _predict(self, dataset: Dataset) -> npt.NDArray[np.float64]:
@@ -210,7 +225,43 @@ class XGBoostModel(AnchoredModel):
         )
         return self._restore_level(dataset, predicted)
 
+    def feature_importance(self) -> pd.Series | None:
+        """Return each feature's total gain, largest first.
 
+        Returns
+        -------
+        pandas.Series or None
+            One entry per feature, zero where the booster never split on it, or None before fitting.
+        """
+        if not self.is_fitted or self._estimator is None:
+            return None
+        gain = self._estimator.get_booster().get_score(importance_type="total_gain")
+        # Features never split on are absent from get_score, so they are filled with zero.
+        series = pd.Series(gain, dtype="float64").reindex(list(self._feature_columns), fill_value=0.0)
+        series.name = "total_gain"
+        return series.sort_values(ascending=False)
+
+    def shap_values(self, dataset: Dataset) -> pd.DataFrame | None:
+        """Return exact TreeSHAP values, computed by XGBoost itself.
+
+        Parameters
+        ----------
+        dataset : Dataset
+            Rows to explain.
+
+        Returns
+        -------
+        pandas.DataFrame or None
+            One row per dataset row, one column per feature, in dollars of
+            monthly change; None before fitting.
+        """
+        if not self.is_fitted or self._estimator is None:
+            return None
+        columns = list(self._feature_columns)
+        matrix = DMatrix(dataset.frame.loc[:, columns])
+        # The last column is the bias (the average change), not a feature.
+        contributions = self._estimator.get_booster().predict(matrix, pred_contribs=True)[:, :-1]
+        return pd.DataFrame(contributions, columns=columns, index=dataset.frame.index)
 
     def describe(self) -> str:
         """Return a one-line description for the run log.

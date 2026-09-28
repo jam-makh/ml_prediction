@@ -428,6 +428,26 @@ def _trailing(months: int) -> WindowSpec:
     )
 
 
+def _full(value: Column, basis: Column, months: int) -> Column:
+    """Keep a window aggregate only when every month of its window holds a value.
+
+    Parameters
+    ----------
+    value : pyspark.sql.Column
+        The aggregate over ``_trailing(months)``.
+    basis : pyspark.sql.Column
+        Column the aggregate reads, counted to check the window is complete.
+    months : int
+        Window length in rows.
+
+    Returns
+    -------
+    pyspark.sql.Column
+        ``value``, or null while the window is still short.
+    """
+    return F.when(F.count(basis).over(_trailing(months)) == months, value)
+
+
 def _history() -> WindowSpec:
     """Window over every earlier row of the same user, up to and including M.
 
@@ -463,11 +483,14 @@ def _add_trend(frame: DataFrame) -> DataFrame:
     trended = frame.withColumns(
         {
             HISTORY: F.count(balance).over(window),
-            "roll6_mean_balance": F.avg(balance).over(window),
-            "roll6_std_balance": F.stddev_samp(balance).over(window),
-            # OLS slope in dollars per month; null with a single month, where the variance is zero.
-            "roll6_slope_balance": F.covar_pop(x, balance).over(window)
-            / F.nullif(F.var_pop(x).over(window), F.lit(0.0)),
+            "roll6_mean_balance": _full(F.avg(balance).over(window), balance, WINDOW_MONTHS),
+            "roll6_std_balance": _full(F.stddev_samp(balance).over(window), balance, WINDOW_MONTHS),
+            # OLS slope in dollars per month over the full six months.
+            "roll6_slope_balance": _full(
+                F.covar_pop(x, balance).over(window) / F.nullif(F.var_pop(x).over(window), F.lit(0.0)),
+                balance,
+                WINDOW_MONTHS,
+            ),
         }
     )
     return trended.withColumn(
@@ -490,8 +513,9 @@ def _add_change(frame: DataFrame) -> DataFrame:
         With ``prev_1m_change`` and ``roll3_mean_change``.
     """
     changed = frame.withColumn("prev_1m_change", F.col(BALANCE) - F.col(PREV_BALANCE))
+    change = F.col("prev_1m_change")
     # Rows M-2..M hold the changes of months M-3..M-1.
-    return changed.withColumn("roll3_mean_change", F.avg("prev_1m_change").over(_trailing(3)))
+    return changed.withColumn("roll3_mean_change", _full(F.avg(change).over(_trailing(3)), change, 3))
 
 
 def _add_flow_volatility(frame: DataFrame) -> DataFrame:
@@ -509,7 +533,8 @@ def _add_flow_volatility(frame: DataFrame) -> DataFrame:
     """
     window = _trailing(WINDOW_MONTHS)
     flow = F.col(NET_FLOW)
-    spread = F.stddev_samp(flow).over(window)
+    # Null while the window is short, which nulls the two ratios built on it.
+    spread = _full(F.stddev_samp(flow).over(window), flow, WINDOW_MONTHS)
     return frame.withColumns(
         {
             "roll6_std_net_flow": spread,
@@ -537,8 +562,9 @@ def _add_income(frame: DataFrame) -> DataFrame:
     credited = F.col(CREDITED)
     # Absolute value, so the result holds whichever sign v1 stores debits with.
     debited = F.abs(F.col(DEBITED))
-    mean_credited = F.avg(credited).over(window)
-    turnover = F.avg(credited + debited).over(window)
+    # Null while the window is short, which nulls every ratio built on them.
+    mean_credited = _full(F.avg(credited).over(window), credited, WINDOW_MONTHS)
+    turnover = _full(F.avg(credited + debited).over(window), credited + debited, WINDOW_MONTHS)
     return frame.withColumns(
         {
             "turnover_roll6": turnover,
@@ -599,23 +625,26 @@ def _add_sign_debt(frame: DataFrame) -> DataFrame:
     months_since = F.coalesce(
         F.col(MONTH_INDEX) - last_flip + 1, F.count(balance).over(_history())
     )
-    trough = F.min(balance).over(window)
+    trough = _full(F.min(balance).over(window), balance, WINDOW_MONTHS)
     points = F.array_sort(
         F.collect_list(
             F.when(balance.isNotNull(), F.struct(F.col(MONTH_INDEX).alias("t"), balance.alias("b")))
         ).over(window)
     )
+    flip = F.col(FLIP)
     return flipped.withColumns(
         {
-            "share_neg_last_6m": F.avg(is_negative.cast("double")).over(window),
+            "share_neg_last_6m": _full(F.avg(is_negative.cast("double")).over(window), balance, WINDOW_MONTHS),
             "months_since_sign_flip": months_since.cast("double"),
             # Rows M-4..M hold the five sign changes between months M-6..M-1.
-            "sign_flips_6m": F.sum(F.col(FLIP)).over(_trailing(WINDOW_MONTHS - 1)).cast("double"),
+            "sign_flips_6m": _full(
+                F.sum(flip).over(_trailing(WINDOW_MONTHS - 1)), flip, WINDOW_MONTHS - 1
+            ).cast("double"),
             # Deepest debt of the window in months of turnover, so it does not measure account size.
             "debt_depth_6m": safe_divide(
-                F.when(trough < 0, -trough).otherwise(0.0), F.col("turnover_roll6")
+                F.when(trough < 0, -trough).when(trough >= 0, 0.0), F.col("turnover_roll6")
             ),
-            "drawdown_6m": _max_drawdown(points),
+            "drawdown_6m": _full(_max_drawdown(points), balance, WINDOW_MONTHS),
         }
     )
 

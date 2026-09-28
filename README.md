@@ -116,9 +116,9 @@ Trimming whales at 3% brings the booster level with persistence but no further
 | model | train_mae | test_mae | gap | test_wape | r2_change | skill |
 |---|---|---|---|---|---|---|
 | persistence | 6,865 | **17,591** | 2.56 | **12.544** | -0.011 | ref |
-| xgboost_change | 6,489 | 17,595 | 2.71 | 12.547 | -0.006 | +0.003 |
+| xgboost | 6,489 | 17,595 | 2.71 | 12.547 | -0.006 | +0.003 |
 | three_month_average | 8,485 | 31,111 | 3.67 | 22.185 | -4.641 | -1.362 |
-| ridge_change | 11,091 | 35,067 | 3.16 | 25.006 | -1.820 | -0.670 |
+| ridge | 11,091 | 35,067 | 3.16 | 25.006 | -1.820 | -0.670 |
 
 With the randomised search **switched off** -- fixed defaults, 300 rounds,
 depth 4 -- the same trim pushes `r2_change` to **+0.026**, the only positive
@@ -145,7 +145,7 @@ Run of 2026-09-22 on v1 (`feature_store_monthly`, 26 columns; xgboost drops
 the 9 in `data.drop_columns.xgboost` and trains on 17), trained through
 2024-11. Optuna ran 50 trials on the 5 training-region CV folds, weighted
 linearly toward the later folds. The holdout was not read by any trial. The
-full record is in `models/xgboost_change_best_params.json`.
+full record is in `models/xgboost_best_params.json`.
 
 | parameter | value |
 |---|---|
@@ -171,9 +171,9 @@ Holdout (2024-12..2025-06), same run:
 
 | model | train_mae | test_mae | gap | test_wape | r2_change | skill_mae |
 |---|---|---|---|---|---|---|
-| xgboost_change | 7,393 | **21,700** | 2.94 | **15.064** | +0.009 | +0.009 |
+| xgboost | 7,393 | **21,700** | 2.94 | **15.064** | +0.009 | +0.009 |
 | persistence | 8,224 | 21,903 | 2.66 | 15.205 | -0.011 | ref |
-| ridge_change | 8,324 | 22,419 | 2.69 | 15.563 | -0.058 | -0.024 |
+| ridge | 8,324 | 22,419 | 2.69 | 15.563 | -0.058 | -0.024 |
 | three_month_average | 9,815 | 35,747 | 3.64 | 24.815 | -4.180 | -0.632 |
 
 The tuned booster beats persistence by 0.9% MAE on the holdout. That is the
