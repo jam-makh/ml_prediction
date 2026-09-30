@@ -50,7 +50,7 @@ from src.feature_selection import (
     shap_importance,
 )
 from src.log import console_level, setup_logging
-from src.metrics import Scores, anchor_values, score
+from src.metrics import Scores, anchor_values, grade, score
 from src.models_code.anchored_model import AnchoredModel
 from src.models_code.base_class import Model
 from src.models_code.ridge_reg import RidgeRegression
@@ -149,10 +149,18 @@ def combined_table(
         rows.append(
             {
                 "model": name,
+                "train_mse": fitted.mse if fitted is not None else float("nan"),
+                "test_mse": report.scores.mse,
                 "train_rmse": train_rmse,
                 "test_rmse": test_rmse,
                 "train_mae": train_mae,
                 "test_mae": test_mae,
+                "train_median_ae": fitted.median_ae if fitted is not None else float("nan"),
+                "test_median_ae": report.scores.median_ae,
+                "train_sme": fitted.sme if fitted is not None else float("nan"),
+                "test_sme": report.scores.sme,
+                "train_smape": fitted.smape if fitted is not None else float("nan"),
+                "test_smape": report.scores.smape,
                 # Over MAE, not RMSE. RMSE on this panel is set by a handful of
                 # very large accounts, so the RMSE ratio measures how calm those
                 # accounts happened to be in the holdout window rather than how
@@ -175,6 +183,55 @@ def combined_table(
             }
         )
     return pd.DataFrame(rows).set_index("model").sort_values("test_wape")
+
+
+def percent_table(
+    train_scores: dict[str, Scores],
+    reports: dict[str, EvaluationReport],
+    reference_model: str = "persistence",
+) -> pd.DataFrame:
+    """Express every model's errors as percentages, so they read without knowing the dollar scale.
+
+    Parameters
+    ----------
+    train_scores : dict of str to Scores
+        In-sample scores from ``in_sample_scores``.
+    reports : dict of str to EvaluationReport
+        Holdout reports from ``src.test.run``.
+    reference_model : str, optional
+        The naive baseline MASE divides by. Default ``persistence``.
+
+    Returns
+    -------
+    pandas.DataFrame
+        One row per model, best holdout WAPE first, with a ``grade`` band on test WAPE.
+    """
+    reference = reports.get(reference_model)
+    reference_mae = reference.scores.mae if reference is not None else float("nan")
+
+    rows = []
+    for name, report in reports.items():
+        test = report.scores
+        fitted = train_scores.get(name)
+        rows.append(
+            {
+                "model": name,
+                "train_wape_%": fitted.wape if fitted is not None else float("nan"),
+                "test_wape_%": test.wape,
+                # WAPE is MAE over mean|truth|, so scaling it by RMSE/MAE gives RMSE over mean|truth|.
+                "test_nrmse_%": test.wape * test.rmse / test.mae if test.mae else float("nan"),
+                "test_smape_%": test.smape,
+                # Well above ~1.5 means a few large misses dominate the error.
+                "rmse/mae": test.rmse / test.mae if test.mae else float("nan"),
+                "test_wape_change_%": test.wape_change,
+                # MASE: below 1 beats the naive baseline, above 1 loses to it.
+                "mase": test.mae / reference_mae if reference_mae else float("nan"),
+                "r2_change": test.r2_change,
+                "gap_%": 100.0 * (test.mae / fitted.mae - 1.0) if fitted is not None and fitted.mae else float("nan"),
+                "grade": grade(test.wape),
+            }
+        )
+    return pd.DataFrame(rows).set_index("model").sort_values("test_wape_%")
 
 
 def run_once(config: dict[str, Any] | None = None, quiet: bool = False) -> pd.DataFrame:
@@ -220,6 +277,10 @@ def run_once(config: dict[str, Any] | None = None, quiet: bool = False) -> pd.Da
     predictions_table(models, seen, evaluation.anchor_column).to_csv(predictions_path, index=False)
     logger.info(f"\n  Predictions: {predictions_path} and predictions_test.csv")
     table = combined_table(train_scores, reports, evaluation.reference_model)
+    # Persist the train-vs-test comparison next to the prediction files.
+    table_path = resolve_output_dir(settings) / "train_vs_test.csv"
+    table.to_csv(table_path)
+    logger.info(f"  Train vs test table: {table_path}")
 
     logger.info("\n" + "=" * 78)
     logger.info("  TRAIN vs TEST")
@@ -236,6 +297,28 @@ def run_once(config: dict[str, Any] | None = None, quiet: bool = False) -> pd.Da
         "\n  skill    versus the reference baseline, on RMSE. Positive means it"
         "\n           earned its complexity; around zero means it did not."
         "\n  skill_mae  the same on MAE: 1 - test_mae / reference test_mae."
+        "\n  sme      signed mean error, truth - prediction. Positive = predicts too low."
+        "\n  smape    symmetric % error, 0-200. Scale-free, so small accounts count equally."
+    )
+
+    percents = percent_table(train_scores, reports, evaluation.reference_model)
+    # Saved beside the dollar table so both can be opened side by side.
+    percents.to_csv(resolve_output_dir(settings) / "train_vs_test_percent.csv")
+
+    logger.info("\n" + "=" * 78)
+    logger.info("  TRAIN vs TEST  (percent)")
+    logger.info("=" * 78)
+    logger.info(percents.to_string(float_format=lambda value: f"{value:,.2f}"))
+    logger.info(
+        "\n  wape_%         MAE as % of the average balance. Graded: <10 highly accurate,"
+        "\n                 10-20 good, 20-50 reasonable, 50+ poor."
+        "\n  nrmse_%        RMSE as % of the average balance; punishes big misses more."
+        "\n  rmse/mae       well above ~1.5 means a few outliers dominate the error."
+        "\n  wape_change_%  error as % of the real month-to-month movement. The honest one."
+        "\n  mase           test MAE / reference test MAE. Below 1 beats 'no change'."
+        "\n  gap_%          how much worse test MAE is than train MAE. +100% = doubled."
+        "\n  The grade is on the balance, which last month's value already explains,"
+        "\n  so judge models on wape_change_% and mase, not on the grade alone."
     )
     report_tuning(models)
     report_selection(models, settings)

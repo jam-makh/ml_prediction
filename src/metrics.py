@@ -34,36 +34,6 @@ and there are two candidates:
     change" or is exposed. A negative value means the model is doing worse than
     predicting that nothing moves.
 
-So one set of dollar errors, reported once, and two R squareds that disagree.
-The disagreement is the finding.
-
-One metric is deliberately near-absent. MAPE and its relatives divide by the
-true value, and these balances cross zero and sit near it for plenty of users,
-so the percentage error explodes on exactly the rows where the dollar error is
-smallest. A version restricted to rows above a floor is available, reported
-alongside the share of rows it could be computed on, so it cannot be quoted
-without its caveat attached.
-
-The formulas, with e_i = y_i - yhat_i::
-
-    RMSE       sqrt( mean( e_i^2 ) )
-    MAE        mean( |e_i| )
-    median AE  median( |e_i| )
-    bias       mean( e_i )                    signed, in evaluate.py
-    R2         1 - sum(e_i^2) / sum( (y_i - ybar)^2 )
-    skill      1 - RMSE_model / RMSE_reference
-
-``r2_level`` puts the balance in the denominator, ``r2_change`` puts the
-movement ``y_i - anchor_i`` there. Skill compares two models directly and needs
-no denominator of its own, which is why it survives a skewed target better than
-either R squared.
-
-Which of these to quote is a judgement, and it belongs with the data rather than
-in a rule. On this panel the ten worst users carry roughly three quarters of the
-total squared error, so RMSE ranks models mostly by how well they fit ten
-accounts out of a hundred and fifty. The median absolute error is the default
-ranking (``evaluation.headline_metric``) because it describes the typical user,
-with RMSE kept beside it because the tail is somebody's problem too.
 """
 
 from __future__ import annotations
@@ -93,6 +63,11 @@ class Scores(BaseModel):
     ----------
     n_rows : int
         Rows the dollar errors were computed over.
+    mse : float
+        Mean squared error, in squared dollars. RMSE before the square root.
+    sme : float
+        Signed mean error, truth minus prediction, in dollars. Positive means
+        the model predicts too low on average.
     rmse : float
         Root mean squared error, in dollars. Squaring means the largest accounts
         dominate it, which matters on a target this skewed.
@@ -159,6 +134,8 @@ class Scores(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     n_rows: int
+    mse: float
+    sme: float
     rmse: float
     mae: float
     median_ae: float
@@ -373,7 +350,10 @@ def score(
     truth, prediction = _finite_pair(_as_array(y_true), _as_array(y_pred))
     errors = truth - prediction
 
-    rmse = float(np.sqrt(np.mean(np.square(errors))))
+    mse = float(np.mean(np.square(errors)))
+    rmse = float(np.sqrt(mse))
+    # Signed, so over- and under-predictions cancel and only a systematic lean remains.
+    sme = float(np.mean(errors))
     mae = float(np.mean(np.abs(errors)))
     median_ae = float(np.median(np.abs(errors)))
     wape_level = wape(truth, prediction)
@@ -410,6 +390,8 @@ def score(
 
     return Scores(
         n_rows=int(truth.size),
+        mse=mse,
+        sme=sme,
         rmse=rmse,
         mae=mae,
         median_ae=median_ae,
@@ -449,6 +431,29 @@ def wape(
     if denominator <= 0.0:
         return float("nan")
     return 100.0 * float(np.sum(np.abs(truth - prediction))) / denominator
+
+
+def grade(percent: float) -> str:
+    """Map a percentage error to the usual forecast-accuracy band.
+
+    Parameters
+    ----------
+    percent : float
+        An error expressed as a percentage, such as WAPE or sMAPE.
+
+    Returns
+    -------
+    str
+        ``highly accurate`` (<10), ``good`` (10-20), ``reasonable`` (20-50),
+        ``poor`` (>=50), or ``n/a`` for NaN.
+    """
+    if np.isnan(percent):
+        return "n/a"
+    # Upper bound of each band, checked in order from the tightest.
+    for limit, label in ((10.0, "highly accurate"), (20.0, "good"), (50.0, "reasonable")):
+        if percent < limit:
+            return label
+    return "poor"
 
 
 def assign_tiers(

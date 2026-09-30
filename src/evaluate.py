@@ -5,7 +5,7 @@ those arrays may contain, refuses the ones that would produce a flattering
 score, and turns a fitted model plus a split into a report a person can argue
 with.
 
-Three things happen here that do not happen in ``metrics.py``.
+Two things happen here that do not happen in ``metrics.py``.
 
 **The out-of-sample check.** Every evaluation asserts that the first month being
 scored is strictly after the last month the model was trained on. The splitter
@@ -19,11 +19,6 @@ is it worst, and is that a data problem, a feature problem or a real limit" is
 the question the findings have to answer. So the report carries error by month,
 error by user, and the quantiles of the absolute error, because on a target this
 skewed the mean and the median tell different stories and both are true.
-
-**The bias check.** Mean error, signed. A model can have a respectable RMSE and
-still be systematically low by a few thousand dollars on every row, which no
-absolute-error metric will ever show. On a balance forecast that is the
-difference between noisy and wrong.
 """
 
 from __future__ import annotations
@@ -185,9 +180,6 @@ class EvaluationReport(BaseModel):
         Rows scored.
     scores : Scores
         The headline metrics.
-    bias : float
-        Mean signed error, truth minus prediction, in dollars. Positive means
-        the model predicts too low on average.
     absolute_error_quantiles : dict of str to float
         Absolute error at p50, p75, p90, p95 and p99. The shape of the tail,
         which a single average hides.
@@ -212,7 +204,6 @@ class EvaluationReport(BaseModel):
     scored_months: list[str]
     n_rows: int
     scores: Scores
-    bias: float
     absolute_error_quantiles: dict[str, float] = Field(default_factory=dict)
     worst_months: list[dict[str, Any]] = Field(default_factory=list)
     worst_users: list[dict[str, Any]] = Field(default_factory=list)
@@ -237,7 +228,7 @@ class EvaluationReport(BaseModel):
         return (
             f"{self.model_name} on {span} ({self.n_rows:,} rows)\n"
             f"  {self.scores.describe()}\n"
-            f"  bias {self.bias:+,.0f} | p90 abs error "
+            f"  sme {self.scores.sme:+,.0f} | p90 abs error "
             f"{self.absolute_error_quantiles.get('p90', float('nan')):,.0f} | "
             f"worst month {worst} | top {WORST_N} users hold "
             f"{100 * self.share_of_error_top_users:.0f}% of squared error"
@@ -428,7 +419,6 @@ def evaluate_predictions(
         scored_months=months,
         n_rows=test.n_rows,
         scores=scores,
-        bias=float(errors.mean()),
         by_tier=_as_records(by_tier, "tier"),
         absolute_error_quantiles=error_quantiles(errors),
         worst_months=[
@@ -620,7 +610,7 @@ def report_table(reports: dict[str, EvaluationReport], sort_by: str = "median_ae
             "wape": report.scores.wape,
             "smape": report.scores.smape,
             "p90_ae": report.absolute_error_quantiles.get("p90", float("nan")),
-            "bias": report.bias,
+            "sme": report.scores.sme,
             "r2_level": report.scores.r2_level,
             "r2_change": report.scores.r2_change,
             "mae_change": report.scores.mae_change,
