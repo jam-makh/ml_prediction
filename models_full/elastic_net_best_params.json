@@ -1,0 +1,56 @@
+{
+  "model": "elastic_net",
+  "trained_through": "2024-11",
+  "saved_at": "2026-10-01T00:14:32",
+  "best_params": {
+    "alpha": 72.15364704443121,
+    "l1_ratio": 0.46362586472894785
+  },
+  "optuna": {
+    "study": "v3_elastic_net",
+    "storage": "optuna_study.db",
+    "objective": "linear-weighted mean over folds of MAE / persistence MAE",
+    "best_value": 1.0289,
+    "best_trial": 18,
+    "best_params": {
+      "alpha": 72.15364704443121,
+      "l1_ratio": 0.46362586472894785
+    },
+    "fold_ratio": [
+      1.063,
+      1.0297,
+      1.0789,
+      1.0144,
+      1.0034
+    ],
+    "fold_mae": [
+      4850.49,
+      6294.97,
+      3280.45,
+      16957.76,
+      26975.81
+    ],
+    "reference_fold_mae": [
+      4563.01,
+      6113.67,
+      3040.51,
+      16717.12,
+      26883.73
+    ],
+    "fold_weights": [
+      0.0667,
+      0.1333,
+      0.2,
+      0.2667,
+      0.3333
+    ],
+    "seed_check": {
+      "1": 1.0289,
+      "2": 1.0289,
+      "3": 1.0289
+    },
+    "n_trials": 50,
+    "n_complete": 50,
+    "n_pruned": 0
+  }
+}

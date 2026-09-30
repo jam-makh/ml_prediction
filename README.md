@@ -91,6 +91,45 @@ over the training months only. Trimming the largest *rows* would gap each user's
 own lag features and would select on the target. It is a statement about which
 population is served, not a cleaning step.
 
+## Process followed
+
+```mermaid
+flowchart LR
+    D["Synthetic panel<br/>150 users x 43 months<br/>~80% negative balances"] --> R["Rebuild the target<br/>closing balance"]
+    R --> V1["v1 features<br/>monthly aggregates"]
+    V1 --> V2["v2 ratio features"]
+    V2 --> V3["v3 trailing-window features<br/>+ segment tables"]
+    V3 --> M["ridge / elastic net / xgboost<br/>vs persistence"]
+    M --> RT{"months of history"}
+    RT -->|"< 6"| P["persistence"]
+    RT -->|">= 6"| X["xgboost"]
+```
+
+**The data limits every model.** The dataset is synthetic, and the target
+closing balance had to be reconstructed in earlier steps. That rebuilt target
+carries little month-to-month structure, so no feature set or model clearly
+beats persistence (see Conclusion).
+
+**Segments tried.** Each row is placed from its trailing six months, M-6..M-1.
+Rows with too little history are unassigned (id 0).
+
+| Segmentation | Basis | Categories |
+|---|---|---|
+| Account tier | median \|balance\| over training months | smb, mid, enterprise |
+| Activity tercile | median `prev_1m_txn_count` | low, mid, high |
+| `sign_regime` | share of negative months, debt depth in months of turnover | not always negative, shallow negative, deep negative |
+| `size` | mean monthly credited + \|debited\| | low, mid, high turnover |
+| `behaviour` | net-flow spread / turnover (needs 3+ months) | stable, moderate, dynamic |
+
+- **Tiers:** xgboost lost to persistence in every tier.
+- **Activity terciles:** high-activity users showed momentum in scaled change
+  that held on the holdout, but only on ~50 users.
+- **v3 segments:** ids are fed to xgboost as ordered numbers. Linear models drop them.
+
+**Routing by history.** Users with fewer than 6 months of history use
+persistence, because the trailing-window features are empty for them.
+Users with 6 or more months use xgboost.
+
 ## Conclusion
 
 **Nothing beats persistence on this panel, and the ceiling says nothing will.**
@@ -181,6 +220,27 @@ same size as its CV lead and consistent with the conclusion above: the gain
 is real but marginal. Tuned ridge loses to persistence on both the folds
 (best ratio 1.016) and the holdout (+2.4% MAE). These numbers are for the full panel (`trim_top_entities: 0.0`) and
 cannot be compared with the 3%-trim table above.
+
+## Top-15 feature trial (2026-10-01)
+
+Each family kept only its 15 highest-SHAP features, with RFECV off. The full
+config is in `config/ml_config.full.yaml` and its outputs are in `models_full/`.
+
+- **MSE is in squared dollars.** The billions are RMSE squared
+  (52,445² ≈ 2.75bn). Read RMSE or MAE for the error size.
+- **`alpha` is a penalty, not an error.** CV pushed it to ~1M for ridge and
+  ~82k for elastic net. Elastic net zeroed all 15 coefficients and ridge's SHAP
+  values are under $12, so both reduce to persistence plus mean drift.
+
+| model | full features, test_mae | top-15, test_mae |
+|---|---|---|
+| persistence | **19,165** | **19,165** |
+| xgboost | 19,247 | 19,208 |
+| elastic_net | 19,870 | 19,232 |
+| ridge | 19,981 | 19,328 |
+
+The linear models improve on top-15 only because they fall back to
+persistence. Nothing beats it, which agrees with the Conclusion.
 
 ## Known defects
 

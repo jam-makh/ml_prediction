@@ -14,63 +14,11 @@ data:
     # The base list every family narrows from, so these leave every model.
     mean: []
     # Segment ids are ordered, so trees split on them as numbers; linear models would read them as equal steps.
-    # Top-15 trial: each family keeps only its 15 highest-SHAP features (full config in ml_config.full.yaml).
     ridge_regression:
     - sign_regime_id
     - size_id
     - behaviour_id
-    - prev_1m_total_credited_usd
-    - prev_1m_total_debited_usd
-    - prev_1m_spend_groceries_usd
-    - prev_1m_spend_dining_usd
-    - prev_1m_spend_retail_usd
-    - prev_1m_spend_transport_usd
-    - prev_1m_spend_bills_usd
-    - prev_1m_spend_other_usd
-    - prev_1m_txn_count
-    - prev_1m_distinct_merchants
-    - accounts_held
-    - roll3_std_closing_balance_usd
-    - roll3_mean_total_credited_usd
-    - roll3_mean_total_debited_usd
-    - prev_1m_change
-    - roll6_std_net_flow
-    - change_volatility_6m
-    - flow_volatility_6m
-    - eom_cv_6m
-    - share_neg_last_6m
-    - sign_flips_6m
-    - debt_depth_6m
-    - income_cv_6m
-    - turnover_roll6
-    xgboost:
-    - prev_1m_closing_balance_usd
-    - prev_2m_closing_balance_usd
-    - prev_3m_closing_balance_usd
-    - prev_1m_net_flow_usd
-    - prev_1m_spend_dining_usd
-    - prev_1m_spend_cash_atm_usd
-    - prev_1m_spend_transport_usd
-    - prev_1m_spend_bills_usd
-    - prev_1m_spend_other_usd
-    - accounts_held
-    - roll3_mean_closing_balance_usd
-    - roll3_std_closing_balance_usd
-    - roll3_mean_total_credited_usd
-    - roll6_mean_balance
-    - roll6_std_balance
-    - net_flow_cv
-    - change_volatility_6m
-    - flow_volatility_6m
-    - eom_cv_6m
-    - share_neg_last_6m
-    - sign_flips_6m
-    - debt_depth_6m
-    - drawdown_6m
-    - turnover_roll6
-    - sign_regime_id
-    - size_id
-    - behaviour_id
+    xgboost: []
   default_drop_columns: mean
   random_state: 42
 split:
@@ -101,8 +49,7 @@ feature_selection:
   # RFECV on `model` with Optuna's params, on the same folds, scored by WAPE on
   # the change target. Survivors go to models/<model>_rfecv.json, the CV table and the final fit.
   rfecv:
-    # Off for the top-15 trial so RFECV cannot prune below 15.
-    enabled: false
+    enabled: true
     # Features removed per round; raise it if a run takes too long.
     step: 1
     min_features: 1
