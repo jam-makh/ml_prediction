@@ -281,7 +281,7 @@ Holdout (2024-12..2025-07), top-15 run:
 | three_month_average | 9,815 | 33,186 | 3.38 | 22.548 | -4.226 | -0.732 |
 
 The CV lead does not survive the holdout: persistence is best, and the paired
-test under Scenario tests finds no real difference.
+test under Tests finds no real difference.
 
 ## Top-15 feature trial (2026-10-01)
 
@@ -304,31 +304,31 @@ config is in `config/ml_config.full.yaml` and its outputs are in `models_full/`.
 The linear models improve on top-15 only because they fall back to
 persistence. Nothing beats it, which agrees with the Conclusion.
 
-## Scenario tests
+## Tests
 
 Run `pytest -s` from the project root. It needs Postgres up and both
-`models/` (top-15) and `models_full/` (full features) trained.
+`models/` (top-15) and `models_full/` (full features) trained. Results of
+2026-10-01; the % is the challenger's change in test MAE, + means worse.
 
-| File | What it does | Why |
+| Test | Definition | Result |
 |---|---|---|
-| `src/scenarios.py` | Defines the holdout slices (`SCENARIOS`) and the paired champion-challenger test | Lives in `src/` so the pipeline can reuse it |
-| `tests/conftest.py` | Loads the saved models, the train/holdout split and both prediction files, once | Every test shares one load |
-| `tests/test_champion_challenger.py` | Checks the two prediction files align, then writes `results/scenario_tests.csv` | Report only: losing to persistence is a finding, not a failure |
-| `tests/test_no_balance.py` | Blanks last month's balance and checks each model falls back to `prev_2m` → `prev_3m` → training median | Hard pass/fail: a wrong fallback is a defect |
-| `pytest.ini` | Puts the project root on the path and points pytest at `tests/` | So `src` imports without installing |
+| Prediction files align | Both runs score the same 1,200 holdout rows with the same truth | **Pass** |
+| Paired Champion Challenger | Same rows, per-row \|error\| difference; 95% interval by resampling users, Wilcoxon on per-user means | **No difference** in all 12 comparisons: xgboost top-15 vs persistence +0.22% (p 0.20), full vs persistence +0.43% (p 0.13) |
+| Dynamic Overdraft | Rows with `sign_flips_6m >= 2` (84 rows, 26 users) | **No difference**: top-15 +0.26%, full +0.56% vs persistence |
+| Zero Income | Rows with `prev_1m_total_credited_usd == 0` (116 rows, 47 users) | **No difference**: top-15 +0.73%, full +0.05% vs persistence |
+| Gig Income | Rows with `income_cv_6m >= 1.0`, a fixed line because the training quartile drifted (319 rows, 88 users) | **No difference**: top-15 +0.13%, full +0.02% vs persistence |
+| Top-15 vs full features | xgboost top-15 against xgboost full, on every slice above | **No difference**: -0.21% on all rows (p 0.12) |
+| No Balance Data | Blank last month's balance; a model passes if its MAE stays within 1.5x of the last known balance (`prev_2m` → `prev_3m` → median, MAE ~36k) | **Fail** for persistence, ridge, elastic net and xgboost (MAE ~145-147k); **pass** for three_month_average |
 
-| Case | Rule |
+Not run yet: Thin Data (waits for the router), Recovering, Overshoot Guard and High Burden.
+
+| File | What it does |
 |---|---|
-| Dynamic Overdraft | `sign_flips_6m >= 2` |
-| Zero Income | `prev_1m_total_credited_usd == 0` (last month, the latest known) |
-| Gig Income | `income_cv_6m >= 1.0`; a fixed line, because the training quartile drifted |
-| Paired Champion Challenger | Per-row error difference, resampled by user; Wilcoxon on per-user means |
-
-**Result (2026-10-01).** Every pair on every slice reads "no difference":
-xgboost top-15, xgboost full and persistence are level. No Balance fails for
-every model except `three_month_average`, whose MAE is ~145k against ~36k for
-the last known balance. The anchored models return the predicted change as
-the balance, and persistence returns the training median.
+| `src/scenarios.py` | The holdout slices (`SCENARIOS`) and the paired test; in `src/` so the pipeline can reuse them |
+| `tests/conftest.py` | Loads the saved models, the train/holdout split and both prediction files once |
+| `tests/test_champion_challenger.py` | Alignment check, then writes `results/scenario_tests.csv`. Report only: losing to persistence is a finding, not a failure |
+| `tests/test_no_balance.py` | The No Balance check. Hard pass/fail: a wrong fallback is a defect |
+| `pytest.ini` | Puts the project root on the path and points pytest at `tests/` |
 
 ## Known defects
 
