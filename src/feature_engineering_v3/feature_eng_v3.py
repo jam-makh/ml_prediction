@@ -3,8 +3,8 @@
 Third iteration of the Feature table (v3) and its segment tables.
 
 Reads v1, adds trailing-window features, assigns segments and writes one lookup
-table per segmentation (``seg_sign_regime``, ``seg_size``, ``seg_behaviour``)
-plus ``features_monthly_v3``, which references them through ``*_id`` columns.
+table per segmentation (``seg_sign_regime``, ``seg_size``, ``seg_behaviour``,
+``seg_history``) plus ``features_monthly_v3``, which references them through ``*_id`` columns.
 The ``*_id`` columns are for routing and evaluation only, never model features.
 """
 
@@ -59,7 +59,7 @@ DEBITED = "prev_1m_total_debited_usd"
 
 # Helper columns used while building; none of them reaches the written table.
 MONTH_INDEX = "_month_index"
-HISTORY = "_history_months"
+HISTORY = "history_months"
 FLIP = "_sign_flip"
 
 # v1 columns carried into v3 unchanged. prev_1m_total_spend_usd and the v1 delta column are left out.
@@ -106,7 +106,7 @@ DRAWDOWN_CAP = 2.0
 # Id 0 of every lookup table: rows with too little history or a missing basis value.
 UNASSIGNED_ID = 0
 UNASSIGNED = "unassigned"
-UNASSIGNED_DESCRIPTION = "Too little history or a missing value to place the row; persistence is used."
+UNASSIGNED_DESCRIPTION = "Too little history or a missing value to place the row; the three-month average is used."
 
 SEGMENT_TABLE_SCHEMA = "id INT, category STRING, rule STRING, description STRING"
 
@@ -120,6 +120,11 @@ SIZE_CATEGORIES = (
     ("low_turnover", "Little money moves through the account: mean monthly credited + |debited| over M-6..M-1."),
     ("mid_turnover", "Typical monthly credited + |debited| over M-6..M-1."),
     ("high_turnover", "Large monthly credited + |debited| over M-6..M-1."),
+)
+
+HISTORY_CATEGORIES = (
+    ("thin", "Fewer than the required months with a balance in M-6..M-1; the three-month average predicts."),
+    ("full", "Every month of M-6..M-1 has a balance; xgboost predicts."),
 )
 
 BEHAVIOUR_CATEGORIES = (
@@ -770,7 +775,7 @@ def sign_regime_bands(negative_share: float, debt_depth_months: float) -> tuple[
 
 
 def build_definitions(settings: dict[str, Any]) -> tuple[SegmentDefinition, ...]:
-    """Return the three segmentations with the fixed cuts from the config.
+    """Return the four segmentations with the fixed cuts from the config.
 
     Parameters
     ----------
@@ -780,7 +785,7 @@ def build_definitions(settings: dict[str, Any]) -> tuple[SegmentDefinition, ...]
     Returns
     -------
     tuple of SegmentDefinition
-        ``(sign_regime, size, behaviour)``.
+        ``(sign_regime, size, behaviour, history)``.
 
     Raises
     ------
@@ -808,7 +813,15 @@ def build_definitions(settings: dict[str, Any]) -> tuple[SegmentDefinition, ...]
         ),
         min_months=int(settings["behaviour"]["min_months"]),
     )
-    return sign_regime, size, behaviour
+    # Months are counted, so "fewer than N" is a cut at N - 1 between thin and full.
+    history = SegmentDefinition(
+        name="history",
+        table="seg_history",
+        bands=threshold_bands(
+            HISTORY, [int(settings["history"]["min_months"]) - 1], HISTORY_CATEGORIES
+        ),
+    )
+    return sign_regime, size, behaviour, history
 
 
 def assign_segments(frame: DataFrame, definition: SegmentDefinition) -> DataFrame:
@@ -941,9 +954,9 @@ def log_segment_counts(
                 f" train {train:>5} ({100 * train / train_total:5.1f}%)"
                 f"  holdout {holdout:>5} ({100 * holdout / holdout_total:5.1f}%)"
             )
-            # Unassigned rows always go to persistence, so their size does not matter.
+            # Unassigned rows always go to the three-month average, so their size does not matter.
             if row_id != UNASSIGNED_ID and min(train, holdout) < min_rows:
-                logger.warning(f"{line}  < {min_rows}: router falls back to persistence")
+                logger.warning(f"{line}  < {min_rows}: router falls back to the three-month average")
             else:
                 logger.info(line)
 

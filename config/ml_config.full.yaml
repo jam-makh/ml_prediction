@@ -12,13 +12,17 @@ data:
   time_column: date
   drop_columns:
     # The base list every family narrows from, so these leave every model.
-    mean: []
+    mean:
+    # history_id routes users between the three-month average and xgboost; it is never a feature.
+    - history_id
     # Segment ids are ordered, so trees split on them as numbers; linear models would read them as equal steps.
     ridge_regression:
+    - history_id
     - sign_regime_id
     - size_id
     - behaviour_id
-    xgboost: []
+    xgboost:
+    - history_id
   default_drop_columns: mean
   random_state: 42
 split:
@@ -43,6 +47,9 @@ segments:
     flow_volatility: [0.20, 0.50]
     # Rows with fewer months of history are unassigned.
     min_months: 3
+  history:
+    # Months with a balance in M-6..M-1 needed for xgboost; fewer use the three-month average.
+    min_months: 6
 features: []
 feature_selection:
   model: xgboost

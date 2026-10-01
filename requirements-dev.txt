@@ -18,3 +18,6 @@ ipykernel==7.3.0
 mypy==2.3.1
 pandas-stubs==3.0.5.260730
 types-PyYAML==6.0.12.20260906
+
+# Scenario tests in tests/. Run with:  pytest -s
+pytest==9.1.1

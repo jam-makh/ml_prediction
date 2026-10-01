@@ -1,7 +1,7 @@
 # ml_prediction
 
 Forecasting next month's closing balance per user, from a monthly feature table
-in an existing PostgreSQL instance (read-only, `localhost:5433`).
+in an existing PostgreSQL instance (read-only, `localhost:5434`).
 
 ```bash
 python pipeline.py
@@ -14,7 +14,7 @@ an experiment is a config edit, not a flag.
 
 ```mermaid
 flowchart TD
-    DB[("PostgreSQL<br/>feature_store_monthly (v1, active)<br/><i>read-only, SELECT *</i>")]
+    DB[("PostgreSQL<br/>features_monthly_v3 (v3, active)<br/><i>read-only, SELECT *</i>")]
     DB --> BUILD
 
     subgraph BUILD["build_dataset -- src/data/data.py"]
@@ -24,17 +24,18 @@ flowchart TD
         B1 --> B2
     end
 
-    BUILD --> CUT{"holdout_split<br/>last 7 months"}
+    BUILD --> CUT{"holdout_split<br/>last 8 months"}
 
     CUT -->|"35 months"| TRAIN
-    CUT -->|"7 months, sealed"| TEST
+    CUT -->|"8 months, sealed"| TEST
 
     subgraph TRAIN["src/train.py -- never sees the holdout"]
         direction TB
         T1["5 expanding CV folds"]
-        T2["Optuna search, 50 trials per model<br/><i>ridge + xgboost, objective MAE / persistence MAE</i>"]
+        T2["Optuna search, 50 trials per model<br/><i>ridge, elastic net, xgboost; objective MAE / persistence MAE</i>"]
+        T4["RFECV on xgboost (optional) + SHAP for every model"]
         T3["refit on all 35 months -> models/*.joblib"]
-        T1 --> T2 --> T3
+        T1 --> T2 --> T4 --> T3
     end
 
     TRAIN --> TEST
@@ -79,11 +80,11 @@ which cannot overfit by construction, scored the same 0.81 as the booster. Over
 MAE the two separate at 2.3x and 2.5x. A diagnostic a constant predictor passes
 is not a diagnostic.
 
-**4. WAPE is the headline, and it is not comparable across trim levels.** Total
+**4. WAPE on the balance is flattering, and it is not comparable across trim levels.** Total
 absolute error over total absolute truth. MAPE divides each row by its own
 truth and these balances pass through zero. Removing whales moves WAPE's
 denominator, so WAPE compares models *within* a dataset — never across two.
-Use `skill` and `gap` for that.
+Use `skill` and `gap` for that. To rank models, read `wape_change_%` and `mase`.
 
 **5. The whale trim removes users, not rows.** `data.trim_top_entities` drops
 the largest share of *entities*, ranked on median `|prev_1m_closing_balance_usd|`
@@ -95,14 +96,14 @@ population is served, not a cleaning step.
 
 ```mermaid
 flowchart LR
-    D["Synthetic panel<br/>150 users x 43 months<br/>~80% negative balances"] --> R["Rebuild the target<br/>closing balance"]
+    D["Synthetic panel<br/>150 users x 43 months<br/>~75% negative balances"] --> R["Rebuild the target<br/>closing balance"]
     R --> V1["v1 features<br/>monthly aggregates"]
     V1 --> V2["v2 ratio features"]
     V2 --> V3["v3 trailing-window features<br/>+ segment tables"]
     V3 --> M["ridge / elastic net / xgboost<br/>vs persistence"]
-    M --> RT{"months of history"}
-    RT -->|"< 6"| P["persistence"]
-    RT -->|">= 6"| X["xgboost"]
+    M -.-> RT{"months of history<br/><i>theoretical router</i>"}
+    RT -.->|"< 6"| P["three-month average"]
+    RT -.->|">= 6"| X["xgboost"]
 ```
 
 **The data limits every model.** The dataset is synthetic, and the target
@@ -110,25 +111,92 @@ closing balance had to be reconstructed in earlier steps. That rebuilt target
 carries little month-to-month structure, so no feature set or model clearly
 beats persistence (see Conclusion).
 
-**Segments tried.** Each row is placed from its trailing six months, M-6..M-1.
-Rows with too little history are unassigned (id 0).
+**Feature versions.** Three feature tables were tried; v3 is the one in use.
 
-| Segmentation | Basis | Categories |
-|---|---|---|
-| Account tier | median \|balance\| over training months | smb, mid, enterprise |
-| Activity tercile | median `prev_1m_txn_count` | low, mid, high |
-| `sign_regime` | share of negative months, debt depth in months of turnover | not always negative, shallow negative, deep negative |
-| `size` | mean monthly credited + \|debited\| | low, mid, high turnover |
-| `behaviour` | net-flow spread / turnover (needs 3+ months) | stable, moderate, dynamic |
+| Version | Table | What it added | Outcome |
+|---|---|---|---|
+| v1 | `feature_store_monthly` | Monthly aggregates: balance lags, flows, spend by category, 3-month rolling stats | Baseline feature set |
+| v2 | `feature_store_monthly_v2` | Ratio features (growth, flow-to-balance) | Dropped: it replaced the two strongest v1 features and CV r² fell |
+| **v3** | `features_monthly_v3` | v1 columns + 6-month trailing-window features + segment ids | **In use** |
 
-- **Tiers:** xgboost lost to persistence in every tier.
-- **Activity terciles:** high-activity users showed momentum in scaled change
-  that held on the holdout, but only on ~50 users.
-- **v3 segments:** ids are fed to xgboost as ordered numbers. Linear models drop them.
+### Segments
 
-**Routing by history.** Users with fewer than 6 months of history use
-persistence, because the trailing-window features are empty for them.
-Users with 6 or more months use xgboost.
+v3 places every row into three segmentations. Each uses the trailing six
+months, M-6..M-1, so the label is known on day 1, and is recomputed every
+month, so a user moves segment after a shift. Each has a `seg_*` lookup table
+in Postgres and an `*_id` column in v3. Cut values live in the config under
+`segments`. Id 0 is **unassigned**: the 6-month window is not full yet (each
+user's first 6 months, 900 rows) or a component could not be computed.
+
+**1. `sign_regime`: which side of zero the user lives on** (`sign_regime_id`, `seg_sign_regime`)
+
+| Component | How it is calculated |
+|---|---|
+| `share_neg_last_6m` | Share of the months M-6..M-1 whose closing balance is below zero |
+| `debt_depth_6m` | Lowest balance in M-6..M-1 as a positive amount (0 if it never went negative), divided by `turnover_roll6`. Null when turnover is under $100 |
+
+| Id | Category | Rule | Rows |
+|---|---|---|---|
+| 1 | not_always_negative | `share_neg_last_6m <= 0.9` | 1,624 |
+| 2 | shallow_negative | `share_neg_last_6m > 0.9` and `debt_depth_6m <= 2` | 1,493 |
+| 3 | deep_negative | `share_neg_last_6m > 0.9` and (`debt_depth_6m > 2` or null) | 2,433 |
+
+**2. `size`: how much money moves through the account** (`size_id`, `seg_size`)
+
+| Component | How it is calculated |
+|---|---|
+| `turnover_roll6` | Mean over M-6..M-1 of monthly credited + \|debited\|, in dollars |
+
+| Id | Category | Rule | Rows |
+|---|---|---|---|
+| 1 | low_turnover | `turnover_roll6 <= 5,000` | 666 |
+| 2 | mid_turnover | `5,000 < turnover_roll6 <= 20,000` | 3,512 |
+| 3 | high_turnover | `turnover_roll6 > 20,000` | 1,372 |
+
+Size is measured on turnover, not balance. A month's change cannot exceed what
+flowed in and out, so turnover is the scale of the target: Spearman with
+\|change\| is 0.51 for turnover against 0.35 for median \|balance\|. With ~75%
+of balances negative, \|balance\| mostly re-measures debt depth, which
+`sign_regime` already holds.
+
+**3. `behaviour`: how steady the money flow is** (`behaviour_id`, `seg_behaviour`)
+
+| Component | How it is calculated |
+|---|---|
+| `roll6_std_net_flow` | Standard deviation of monthly net flow (in minus out) over M-6..M-1 |
+| `flow_volatility_6m` | `roll6_std_net_flow` divided by `turnover_roll6`, so large and small accounts compare. Null when turnover is under $100 |
+
+| Id | Category | Rule | Rows |
+|---|---|---|---|
+| 1 | stable | `flow_volatility_6m <= 0.20` | 2,482 |
+| 2 | moderate | `0.20 < flow_volatility_6m <= 0.50` | 2,011 |
+| 3 | dynamic | `flow_volatility_6m > 0.50` | 911 |
+
+Unassigned is 1,046: the 900 short-window rows plus 146 with turnover under
+$100. The config's `min_months: 3` has no effect, because the components need
+the full 6 months anyway.
+
+**How the ids are used.** Per-segment CV (`segment_cv.csv`) checks whether a
+model beats persistence inside each category; none does yet. The full config
+feeds the ids to xgboost as ordered numbers; the top-15 config and the linear
+models drop them.
+
+**Disregarded segmentations.** Account tier (median \|balance\| over the
+training months: smb, mid, enterprise) found xgboost losing to persistence in
+every tier, and `size` replaced it. Activity tercile (median
+`prev_1m_txn_count`) showed momentum that held on the holdout, but only on
+~50 users.
+
+**Future segmentation: `history`** (in the code only; `history_id` and
+`seg_history` appear once the v3 job is re-run). It counts the months with a
+balance in M-6..M-1: thin (< 6) or full (6). It is dropped from every model
+and exists for routing. The router is theoretical: fewer than 6 months would
+go to the three-month average, because their trailing-window features are
+empty, and 6 or more to xgboost. On this panel no scored row is thin, so it
+would not change any result here. It is meant for the Stage 6 DAG, as a
+`RoutedModel` behind the same `Model` interface, used by a `src/predict.py`
+task. The rule stays in the model rather than in DAG branching, so the
+pipeline, the tests and the DAG route the same way.
 
 ## Conclusion
 
@@ -164,8 +232,8 @@ depth 4 -- the same trim pushes `r2_change` to **+0.026**, the only positive
 value anything in this project has produced. The configured search gives
 **-0.006**. The search is picking a worse model on the honest metric: it ranks
 candidates on `r2` over the dollar change (whale-dominated squared error) and
-early stopping then cuts the booster to **6 rounds**. See defect 3 below, and
-do not read the `+0.026` as a pipeline result.
+early stopping then cuts the booster to **6 rounds**. Do not read the
+`+0.026` as a pipeline result. Optuna now ranks on MAE over persistence MAE.
 
 v2 also went backwards where it replaced rather than augmented: it dropped
 `roll3_mean_net_flow_usd` and `prev_1m_net_flow_usd` — the top two features by
@@ -180,46 +248,40 @@ is a legitimate, well-evidenced result and should be reported as the headline.
 
 ## Current xgboost parameters (Optuna)
 
-Run of 2026-09-22 on v1 (`feature_store_monthly`, 26 columns; xgboost drops
-the 9 in `data.drop_columns.xgboost` and trains on 17), trained through
-2024-11. Optuna ran 50 trials on the 5 training-region CV folds, weighted
-linearly toward the later folds. The holdout was not read by any trial. The
-full record is in `models/xgboost_best_params.json`.
+Runs of 2026-10-01 on v3 (`features_monthly_v3`), trained through 2024-11.
+Optuna ran 50 trials on the 5 training-region CV folds, weighted linearly
+toward the later folds. The holdout was not read by any trial. Full records
+are in `models/` (top-15) and `models_full/` (full features).
 
-| parameter | value |
-|---|---|
-| `objective` | `reg:absoluteerror` |
-| `n_estimators` | 196 |
-| `max_depth` | 6 |
-| `learning_rate` | 0.0542 |
-| `min_child_weight` | 5.40 |
-| `subsample` | 0.923 |
-| `colsample_bytree` | 0.559 |
-| `reg_lambda` | 14.27 |
-| `clip` (training movement only) | `q0.99` (fitted cap $121,648) |
-| `market_scale` | false |
-| `recency_half_life` | 12 months |
+| parameter | top-15 (`models/`) | full (`models_full/`) |
+|---|---|---|
+| `objective` | `reg:pseudohubererror` | `reg:pseudohubererror` |
+| `n_estimators` | 315 | 275 |
+| `max_depth` | 5 | 6 |
+| `learning_rate` | 0.0213 | 0.0172 |
+| `min_child_weight` | 5.39 | 5.32 |
+| `subsample` | 0.810 | 0.911 |
+| `colsample_bytree` | 0.526 | 0.782 |
+| `reg_lambda` | 42.83 | 26.12 |
+| CV ratio to persistence MAE | 0.9875 | 0.9876 |
+| seeds 1 / 2 / 3 | 0.9882 / 0.9883 / 0.9894 | 0.9883 / 0.9882 / 0.9888 |
 
-Best trial 33, with a CV ratio to persistence MAE of **0.9906** (below 1.0 beats
-it). Refitted on seeds 1/2/3 it scores 0.9905 / 0.9929 / 0.9912. The ~1% lead is
-only slightly larger than the ~0.25% seed spread. Per fold the ratio is 0.955,
-0.972, 0.978, 1.007, 0.999, so the two folds closest to the holdout are level
-with persistence or worse.
+The ~1.2% CV lead is the same size in both runs. Per fold, the two folds
+closest to the holdout are level with persistence or worse (top-15: 1.004,
+1.000; full: 1.009, 1.002).
 
-Holdout (2024-12..2025-06), same run:
+Holdout (2024-12..2025-07), top-15 run:
 
 | model | train_mae | test_mae | gap | test_wape | r2_change | skill_mae |
 |---|---|---|---|---|---|---|
-| xgboost | 7,393 | **21,700** | 2.94 | **15.064** | +0.009 | +0.009 |
-| persistence | 8,224 | 21,903 | 2.66 | 15.205 | -0.011 | ref |
-| ridge | 8,324 | 22,419 | 2.69 | 15.563 | -0.058 | -0.024 |
-| three_month_average | 9,815 | 35,747 | 3.64 | 24.815 | -4.180 | -0.632 |
+| persistence | 8,224 | **19,166** | 2.33 | **13.022** | -0.009 | ref |
+| xgboost | 7,513 | 19,208 | 2.56 | 13.051 | -0.006 | -0.002 |
+| elastic_net | 8,009 | 19,232 | 2.40 | 13.067 | -0.011 | -0.003 |
+| ridge | 8,017 | 19,328 | 2.41 | 13.133 | -0.016 | -0.008 |
+| three_month_average | 9,815 | 33,186 | 3.38 | 22.548 | -4.226 | -0.732 |
 
-The tuned booster beats persistence by 0.9% MAE on the holdout. That is the
-same size as its CV lead and consistent with the conclusion above: the gain
-is real but marginal. Tuned ridge loses to persistence on both the folds
-(best ratio 1.016) and the holdout (+2.4% MAE). These numbers are for the full panel (`trim_top_entities: 0.0`) and
-cannot be compared with the 3%-trim table above.
+The CV lead does not survive the holdout: persistence is best, and the paired
+test under Scenario tests finds no real difference.
 
 ## Top-15 feature trial (2026-10-01)
 
@@ -242,35 +304,74 @@ config is in `config/ml_config.full.yaml` and its outputs are in `models_full/`.
 The linear models improve on top-15 only because they fall back to
 persistence. Nothing beats it, which agrees with the Conclusion.
 
+## Scenario tests
+
+Run `pytest -s` from the project root. It needs Postgres up and both
+`models/` (top-15) and `models_full/` (full features) trained.
+
+| File | What it does | Why |
+|---|---|---|
+| `src/scenarios.py` | Defines the holdout slices (`SCENARIOS`) and the paired champion-challenger test | Lives in `src/` so the pipeline can reuse it |
+| `tests/conftest.py` | Loads the saved models, the train/holdout split and both prediction files, once | Every test shares one load |
+| `tests/test_champion_challenger.py` | Checks the two prediction files align, then writes `results/scenario_tests.csv` | Report only: losing to persistence is a finding, not a failure |
+| `tests/test_no_balance.py` | Blanks last month's balance and checks each model falls back to `prev_2m` → `prev_3m` → training median | Hard pass/fail: a wrong fallback is a defect |
+| `pytest.ini` | Puts the project root on the path and points pytest at `tests/` | So `src` imports without installing |
+
+| Case | Rule |
+|---|---|
+| Dynamic Overdraft | `sign_flips_6m >= 2` |
+| Zero Income | `prev_1m_total_credited_usd == 0` (last month, the latest known) |
+| Gig Income | `income_cv_6m >= 1.0`; a fixed line, because the training quartile drifted |
+| Paired Champion Challenger | Per-row error difference, resampled by user; Wilcoxon on per-user means |
+
+**Result (2026-10-01).** Every pair on every slice reads "no difference":
+xgboost top-15, xgboost full and persistence are level. No Balance fails for
+every model except `three_month_average`, whose MAE is ~145k against ~36k for
+the last known balance. The anchored models return the predicted change as
+the balance, and persistence returns the training median.
+
 ## Known defects
 
-- `reg:pseudohubererror` predicts a **literal constant** — `huber_slope`
-  defaults to 1 on a dollar-scale target, so the gradient saturates immediately.
-  It appears to win benchmarks because it has rediscovered persistence.
+- **No last balance.** With `prev_1m_closing_balance_usd` missing, ridge,
+  elastic net and xgboost return the predicted change as the balance (~$0),
+  and persistence returns the training median. The fix is one shared
+  `prev_1m` → `prev_2m` → `prev_3m` fallback; `tests/test_no_balance.py` fails until then.
+- **`behaviour.min_months` is inert.** See Segments: the components need 6 months anyway.
+- Fixed: `reg:pseudohubererror` used to predict a constant because
+  `huber_slope` defaulted to 1; it is now set at fit time to the median
+  \|training target\|.
 
 ## Layout
 
 ```
-config/ml_config.yaml             every tunable setting
+config/ml_config.yaml             every tunable setting (top-15 trial)
+config/ml_config.full.yaml        the same with every feature
 pipeline.py                       run everything, print train vs test
 src/data/data.py                  the feature table + the whale trim
 src/data/db_link.py               engine + query to DataFrame (read-only)
+src/config/config.py              config loading and output paths
+src/log.py                        run logs in results/logs/
 src/feature_engineering_v2/       the v2 ratio features
 src/window.py                     holdout and expanding-window CV folds
 src/metrics.py                    scoring, and the two framings to read it in
 src/evaluate.py                   breakdowns by month, user and account tier
+src/scenarios.py                  scenario slices + paired champion-challenger test
 src/optuna_search.py              Optuna study on the CV folds, writes *_best_params.json
-src/importance.py                 gain and coefficient rankings
-src/feature_engineering_v3/       v3 features and segment tables (PySpark)
+src/feature_selection.py          RFECV on xgboost, SHAP, linear coefficient lists
+src/feature_engineering_v3/       v3 features and the four segment tables (PySpark)
 src/models_code/base_class.py     the Model interface, save/load
 src/models_code/exceptions.py     NotFittedError
-src/models_code/anchored_model.py change target, clip, market scale, recency weights
+src/models_code/anchored_model.py change target: learn balance - last balance, add it back
 src/models_code/baseline.py       persistence (n_months 1), 3-month average
 src/models_code/ridge_reg.py      ridge on the monthly change
+src/models_code/elastic_net.py    ridge plus an L1 penalty
 src/models_code/xgboost_model.py  boosted trees, deliberately small
 src/train.py / src/test.py        fit + save / score on unseen months
 notebooks/                        local exploration only
 models/                           one .joblib per model (gitignored)
+models_full/                      the full-feature run, kept for comparison
+results/                          run logs and scenario_tests.csv
+tests/                            scenario report + no-balance fallback test
 ```
 
 ## Resources
