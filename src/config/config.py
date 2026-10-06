@@ -40,16 +40,18 @@ def load_config(path: str | Path | None = None) -> dict[str, Any]:
 def database_url() -> str:
     """Build the SQLAlchemy URL from environment variables.
 
-    Deliberately reads host and port from the environment instead of taking
-    them from the YAML. Postgres has two valid addresses -- localhost:5433
-    from Windows, postgres:5432 from inside the compose network -- and which
-    is correct depends on where this code happens to be running. Compose sets
-    them for the container; .env sets them for the notebook.
+    Host and port come from the environment because they differ by caller:
+    localhost:5434 from Windows, host.docker.internal:5434 from a container.
+
+    Returns
+    -------
+    str
+        The ``postgresql+psycopg2`` connection URL.
     """
     user = os.environ.get("POSTGRES_USER", "pipeline")
     password = os.environ.get("POSTGRES_PASSWORD", "pipeline")
     host = os.environ.get("POSTGRES_HOST", "localhost")
-    port = os.environ.get("POSTGRES_PORT", "5433")
+    port = os.environ.get("POSTGRES_PORT", "5434")
     database = os.environ.get("POSTGRES_DB", "ml_prediction")
     return f"postgresql+psycopg2://{user}:{password}@{host}:{port}/{database}"
 
