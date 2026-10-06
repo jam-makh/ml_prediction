@@ -28,9 +28,9 @@ services:
       # an empty string, the container starts, and the run dies several seconds
       # later on a Postgres authentication error that says nothing about the
       # actual cause.
-      POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER in .env (see .env.example)}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env (see .env.example)}
-      POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB in .env (see .env.example)}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
 
       # THE IMPORTANT PART. "localhost" inside a container means the container
       # itself, not your machine -- so the notebook's localhost:5433 cannot be
@@ -76,9 +76,9 @@ services:
     image: ml-prediction-train
     command: ["python", "-m", "src.test"]
     environment:
-      POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER in .env (see .env.example)}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env (see .env.example)}
-      POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB in .env (see .env.example)}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
       POSTGRES_HOST: host.docker.internal
       POSTGRES_PORT: ${POSTGRES_PORT:-5433}
     extra_hosts:
