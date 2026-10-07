@@ -192,14 +192,21 @@ def check_health_and_maybe_trigger_retrain() -> bool:
 # --- Retrain DAG ------------------------------------------------------------------------------
 
 
-def load_data() -> str:
+def load_data(trigger: str) -> str:
     """Validate the training data and return its hash.
+
+    Parameters
+    ----------
+    trigger : str
+        The run's type: ``scheduled``, ``asset_triggered`` (health decay) or ``manual``.
 
     Returns
     -------
     str
         SHA-256 of the feature rows, passed on so later tasks prove they used the same data.
     """
+    # Says which path started this retrain: the weekly floor, a health decay, or a person.
+    logger.info(f"retrain triggered by: {trigger}")
     dataset = load_dataset(load_config())
     digest = data_hash(dataset.frame)
     logger.info(f"{dataset.summary()}; {dataset.frame.shape[1]} columns; hash {digest}")

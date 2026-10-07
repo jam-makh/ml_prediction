@@ -29,6 +29,9 @@ x-airflow-common: &airflow-common
     # "localhost" inside a container is the container itself; host.docker.internal is the Windows host.
     POSTGRES_HOST: host.docker.internal
     POSTGRES_PORT: ${POSTGRES_PORT:-5434}
+    # Optional overrides of ml_config.yaml's serving.orchestration; empty means "use the config".
+    PREDICT_TIMEOUT_MINUTES: ${PREDICT_TIMEOUT_MINUTES:-}
+    RETRAIN_SCHEDULE: ${RETRAIN_SCHEDULE:-}
   extra_hosts:
     # Docker Desktop defines host.docker.internal already; this makes native Linux behave the same.
     - "host.docker.internal:host-gateway"

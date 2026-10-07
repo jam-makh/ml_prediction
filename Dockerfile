@@ -45,6 +45,9 @@ RUN --mount=type=cache,target=/tmp/.cache/pip,uid=50000,gid=0 \
     pip install "apache-airflow==${AIRFLOW_VERSION}" \
     matplotlib==3.11.1
 
+# The Google provider is unused here, and its db-dtypes dependency caps pandas below 3.
+RUN pip uninstall -y apache-airflow-providers-google pandas-gbq db-dtypes
+
 # Fails the build if any installed package's declared requirements are broken.
 RUN pip check
 

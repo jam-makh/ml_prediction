@@ -214,3 +214,18 @@ serving:
     min_rows: 30
     # No second retrain within 3 days of the last one.
     cooldown_days: 3
+  orchestration:
+    # Weekly floor for the retrain DAG (Monday 00:00 UTC); RETRAIN_SCHEDULE overrides it.
+    retrain_schedule: "0 0 * * 1"
+    # Minutes each task may run; PREDICT_TIMEOUT_MINUTES overrides run_predictions.
+    timeouts:
+      check_pending_rows: 10
+      run_predictions: 60
+      refresh_live_performance: 15
+      check_health_and_maybe_trigger_retrain: 10
+      load_data: 10
+      train_test_split: 10
+      train_and_save_model: 60
+      save_model_performance: 5
+      compare_challenger_to_champion: 10
+      promote_if_approved: 5
