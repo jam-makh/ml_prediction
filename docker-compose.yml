@@ -1,91 +1,130 @@
-# This project does not run its own database. The training data lives in a
-# PostgreSQL that is already running on the host and published on port 5433;
-# the job here only reads a table from it.
+# Airflow 3 on LocalExecutor: one image, five services, plus Airflow's own metadata database.
+# The business database is NOT here: it is the cleaning-postgres container on the host, port 5434.
 #
-# That leaves two services, which are the two halves of the pipeline: the
-# job that fits and saves the models, and the job that scores what it saved.
+#   docker compose up --build -d
+#   docker compose logs -f airflow_scheduler
+#   UI: http://localhost:8080  (login from AIRFLOW_ADMIN_USER / AIRFLOW_ADMIN_PASSWORD in .env)
+
+# Settings shared by every Airflow service, merged in with `<<: *airflow-common`.
+x-airflow-common: &airflow-common
+  build: .
+  image: ml-prediction-airflow
+  environment: &airflow-env
+    # Tasks run as subprocesses of the scheduler; no Celery workers or Redis needed.
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${AIRFLOW_DB_USER:?set AIRFLOW_DB_USER in .env}:${AIRFLOW_DB_PASSWORD:?set AIRFLOW_DB_PASSWORD in .env}@airflow_postgres:5432/airflow
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY:?set AIRFLOW_FERNET_KEY in .env}
+    # Every component must share this secret, or tokens signed by one are rejected by another.
+    AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW_JWT_SECRET:?set AIRFLOW_JWT_SECRET in .env}
+    # FAB gives the username/password login created by airflow_init.
+    AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
+    # Tasks report their state to the API server; the hyphenated alias avoids underscores in a URL host.
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow-apiserver:8080/execution/
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    # Business database credentials; the `:?` form fails at startup instead of on the first query.
+    POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER in .env (see .env.example)}
+    POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env (see .env.example)}
+    POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB in .env (see .env.example)}
+    # "localhost" inside a container is the container itself; host.docker.internal is the Windows host.
+    POSTGRES_HOST: host.docker.internal
+    POSTGRES_PORT: ${POSTGRES_PORT:-5434}
+  extra_hosts:
+    # Docker Desktop defines host.docker.internal already; this makes native Linux behave the same.
+    - "host.docker.internal:host-gateway"
+  volumes:
+    - ./dags:/opt/airflow/dags:ro
+    - ./src:/opt/ml/src:ro
+    # config.py finds config/ via parents[2], so it must sit next to src/.
+    - ./config:/opt/ml/config:ro
+    # Writable: the retraining DAG saves models here and the prediction DAG loads them.
+    - ./models:/opt/ml/models
+    # Shared so the UI can read logs that tasks write inside the scheduler container.
+    - airflow_logs:/opt/airflow/logs
+    # Spark's download cache for the Postgres JDBC jar, kept across container recreates.
+    - spark_ivy:/home/airflow/.ivy2.5.2
+  depends_on: &airflow-depends-on
+    airflow_postgres:
+      condition: service_healthy
 
 services:
-  # The production-shaped half of the pipeline: a batch job, not a server.
-  # Exploration happens in a local notebook against the same code in src/;
-  # this runs the settled version the way a scheduled job would.
-  #
-  #   docker compose run --rm train
-  #
-  # `docker-compose` with a hyphen reaches the same plugin on a current Docker
-  # and works too; the hyphenless form is the one that stays. The filename this
-  # is written in is unrelated to that -- compose finds compose.yaml,
-  # compose.yml, docker-compose.yaml and docker-compose.yml alike.
-  #
-  # --rm because each run is disposable. Everything worth keeping is written
-  # to the bind-mounted ./models on the host, not into the container.
-  train:
-    build: .
-    image: ml-prediction-train
+  # Airflow's own metadata database: DAG runs, task states, users. No published port.
+  airflow_postgres:
+    image: postgres:16
     environment:
-      # Credentials for the EXISTING database, set in .env. The `:?` form is
-      # what makes a missing .env fail loudly: without it compose substitutes
-      # an empty string, the container starts, and the run dies several seconds
-      # later on a Postgres authentication error that says nothing about the
-      # actual cause.
-      POSTGRES_USER: ${POSTGRES_USER}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-      POSTGRES_DB: ${POSTGRES_DB}
-
-      # THE IMPORTANT PART. "localhost" inside a container means the container
-      # itself, not your machine -- so the notebook's localhost:5433 cannot be
-      # reused here. Docker Desktop resolves host.docker.internal to the host,
-      # which is where the database is actually listening.
-      #
-      #   Local notebook  ->  localhost:5433
-      #   This container  ->  host.docker.internal:5433
-      #
-      # Same database, same published port; only the hostname differs. That is
-      # why src/config/config.py reads both from the environment instead of
-      # hardcoding either one.
-      POSTGRES_HOST: host.docker.internal
-      POSTGRES_PORT: ${POSTGRES_PORT:-5433}
-    extra_hosts:
-      # Docker Desktop provides host.docker.internal automatically; this line
-      # makes the same compose file work on native Linux, where it is not
-      # defined by default.
-      - "host.docker.internal:host-gateway"
+      POSTGRES_USER: ${AIRFLOW_DB_USER:?set AIRFLOW_DB_USER in .env}
+      POSTGRES_PASSWORD: ${AIRFLOW_DB_PASSWORD:?set AIRFLOW_DB_PASSWORD in .env}
+      POSTGRES_DB: airflow
     volumes:
-      # Code is mounted, not baked into the image, so an edit on the host
-      # takes effect on the next run with no rebuild. Read-only because the
-      # job has no business rewriting its own source or config.
-      - ./src:/app/src:ro
-      - ./config:/app/config:ro
-      # Writable: this is where trained models land, and the whole point is
-      # that they outlive the container.
-      - ./models:/app/models
-    # No `ports`. This is a job that runs and exits, not a service to reach.
+      - airflow_db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d airflow"]
+      interval: 5s
+      retries: 10
+    restart: unless-stopped
 
-  # The other half: score the models `train` saved, on months none of them has
-  # seen. A separate service for the same reason it is a separate script -- a
-  # job that both fits and reports the headline number can always be edited
-  # into one that reports a number it fitted on.
-  #
-  #   docker compose run --rm test
-  #
-  # Reads ./models rather than writing it: this service produces a table on
-  # stdout and no artefacts. Everything it needs to know about the train/test
-  # boundary is inside the saved model files.
-  test:
-    build: .
-    image: ml-prediction-train
-    command: ["python", "-m", "src.test"]
+  # One-shot: migrate the metadata schema and create the admin user, then exit.
+  airflow_init:
+    <<: *airflow-common
+    command: version
     environment:
-      POSTGRES_USER: ${POSTGRES_USER}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-      POSTGRES_DB: ${POSTGRES_DB}
-      POSTGRES_HOST: host.docker.internal
-      POSTGRES_PORT: ${POSTGRES_PORT:-5433}
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    volumes:
-      - ./src:/app/src:ro
-      - ./config:/app/config:ro
-      # Read-only: scoring must not be able to overwrite the artefact it is
-      # scoring.
-      - ./models:/app/models:ro
+      <<: *airflow-env
+      _AIRFLOW_DB_MIGRATE: "true"
+      _AIRFLOW_WWW_USER_CREATE: "true"
+      _AIRFLOW_WWW_USER_USERNAME: ${AIRFLOW_ADMIN_USER:?set AIRFLOW_ADMIN_USER in .env}
+      _AIRFLOW_WWW_USER_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD:?set AIRFLOW_ADMIN_PASSWORD in .env}
+
+  # UI and REST API, bound to 127.0.0.1 so only this machine can reach it.
+  airflow_apiserver:
+    <<: *airflow-common
+    command: api-server
+    ports:
+      - "127.0.0.1:8080:8080"
+    networks:
+      default:
+        aliases:
+          - airflow-apiserver
+    depends_on:
+      <<: *airflow-depends-on
+      airflow_init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  # Decides what runs when, and runs the tasks itself (LocalExecutor).
+  airflow_scheduler:
+    <<: *airflow-common
+    command: scheduler
+    depends_on:
+      <<: *airflow-depends-on
+      airflow_init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  # Parses dags/*.py into the metadata database; in Airflow 3 the scheduler no longer does this.
+  airflow_dag_processor:
+    <<: *airflow-common
+    command: dag-processor
+    depends_on:
+      <<: *airflow-depends-on
+      airflow_init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Manual pipeline, kept for running train/test by hand outside Airflow.
+  # Uncomment and run with `docker compose run --rm train` (or test).
+  # ---------------------------------------------------------------------------
+  # train:
+  #   <<: *airflow-common
+  #   command: ["python", "-m", "src.train"]
+  #   depends_on: []
+  #
+  # test:
+  #   <<: *airflow-common
+  #   command: ["python", "-m", "src.test"]
+  #   depends_on: []
+
+volumes:
+  airflow_db:
+  airflow_logs:
+  spark_ivy:

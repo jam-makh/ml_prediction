@@ -18,7 +18,6 @@ data:
     # Segment ids are ordered, so trees split on them as numbers; linear models would read them as equal steps.
     # Top-15 trial: each family keeps only its 15 highest-SHAP features (full config in ml_config.full.yaml).
     ridge_regression:
-    - history_id
     - sign_regime_id
     - size_id
     - behaviour_id
@@ -47,7 +46,6 @@ data:
     - income_cv_6m
     - turnover_roll6
     xgboost:
-    - history_id
     - prev_1m_closing_balance_usd
     - prev_2m_closing_balance_usd
     - prev_3m_closing_balance_usd
@@ -194,3 +192,25 @@ optuna:
 output:
   model_dir: models
   feature_table: features_table_two
+serving:
+  # Postgres schema holding checkpoints, predictions, model_performance and live_performance.
+  schema: serving
+  # Champion and challenger folders, relative to the project root; models/ is the writable mount.
+  artifact_dir: models/serving
+  # Tuned xgboost parameters the retrain refits with.
+  params_file: models/xgboost_best_params.json
+  promotion:
+    # Promote only if MAE drops by at least 2%...
+    mae_min_gain: 0.02
+    # ...and RMSE and WAPE rise by no more than 5%.
+    rmse_max_loss: 0.05
+    wape_max_loss: 0.05
+    # Below this many resolved live rows, both models are scored on unseen holdout rows instead.
+    min_live_rows: 30
+  monitoring:
+    # Retrain when live MAE is 10% above the champion's holdout MAE.
+    mae_decay: 0.10
+    window_months: 3
+    min_rows: 30
+    # No second retrain within 3 days of the last one.
+    cooldown_days: 3
