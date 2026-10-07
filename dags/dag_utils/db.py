@@ -1,5 +1,5 @@
 """
-Repository for the ``serving`` schema: the four serving tables and every query against them.
+Repository for the four serving tables in the configured schema and every query against them.
 Create the tables with ``python -m dag_utils.db``; the project root and dags/ go on PYTHONPATH.
 """
 
@@ -39,7 +39,7 @@ from src.data.db_link import get_engine
 
 
 class PredictionRow(BaseModel):
-    """One served prediction, as written to ``serving.predictions``.
+    """One served prediction, as written to ``predictions``.
 
     Parameters
     ----------
@@ -63,7 +63,7 @@ class PredictionRow(BaseModel):
 
 
 class PerformanceRow(BaseModel):
-    """Scores of one model version on one split, as written to ``serving.model_performance``.
+    """Scores of one model version on one split, as written to ``model_performance``.
 
     Parameters
     ----------
@@ -434,7 +434,7 @@ class ServingRepository:
         Returns
         -------
         pandas.DataFrame
-            Columns of ``serving.live_performance`` plus ``route``.
+            Columns of ``live_performance`` plus ``route``.
         """
         live, p = self.live_performance, self.predictions
         query = (

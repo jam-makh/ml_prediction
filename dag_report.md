@@ -7,7 +7,7 @@ Two batch DAGs under `dags/`, both thin wiring over `dags/dag_utils/`. Every tas
 | Schedule | `@daily` | Monday 00:00 UTC (`RETRAIN_SCHEDULE` overrides), or early on a health-check asset event |
 | `max_active_runs` / `catchup` | 1 / False | 1 / False |
 | Reads | Feature rows newer than each user's checkpoint | Full feature table |
-| Writes | `serving.predictions`, `checkpoints`, `live_performance` | `models/serving/challenger/`, `serving.model_performance`, and the champion on promotion |
+| Writes | `predictions`, `checkpoints`, `live_performance` | `models/serving/challenger/`, `model_performance`, and the champion on promotion |
 
 ## 1. Prediction DAG (daily)
 
@@ -90,8 +90,8 @@ flowchart TD
 
 ## 6. Traceability
 
-- **Prediction → model:** `model_version` (e.g. `xgb-20261007T0600-1a2b3c4d`) is on every row of `serving.predictions`.
-- **Model → data and code:** `models/serving/<champion|challenger>/metadata.json` holds the data hash, training date, scores and git commit; `serving.model_performance` repeats the hash.
+- **Prediction → model:** `model_version` (e.g. `xgb-20261007T0600-1a2b3c4d`) is on every row of `predictions`.
+- **Model → data and code:** `models/serving/<champion|challenger>/metadata.json` holds the data hash, training date, scores and git commit; `model_performance` repeats the hash.
 
 ## 7. Monitoring
 

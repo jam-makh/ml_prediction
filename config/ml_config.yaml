@@ -194,7 +194,7 @@ output:
   feature_table: features_table_two
 serving:
   # Postgres schema holding checkpoints, predictions, model_performance and live_performance.
-  schema: serving
+  schema: public
   # Champion and challenger folders, relative to the project root; models/ is the writable mount.
   artifact_dir: models/serving
   # Tuned xgboost parameters the retrain refits with.
